@@ -14,6 +14,7 @@ describe('buildConfigFile', () => {
     expect(text).toContain('DISCORD_BOT_TOKEN=discord-token');
     expect(text).toContain('TRIGGER_NAME=PiBot');
     expect(text).toContain('PI_CWD=/workspace/project');
+    expect(text).toContain('MAX_ATTACHMENT_BYTES=10485760');
     expect(text).toContain('SESSIONS_DIR=/var/lib/pi-discord/sessions');
     expect(text).toContain('DB_PATH=/var/lib/pi-discord/gateway.db');
   });

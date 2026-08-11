@@ -253,7 +253,7 @@ export function buildConfigFile(options: {
     'AUTO_REGISTER_DMS=true',
     `CHANNEL_POLICY=${options.channelPolicy ?? 'open'}`,
     'EXCLUDED_CHANNELS=',
-    'MAX_ATTACHMENT_BYTES=26214400',
+    'MAX_ATTACHMENT_BYTES=10485760',
     'MAX_TOTAL_ATTACHMENT_BYTES=52428800',
     '',
     '# Archive',

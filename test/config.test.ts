@@ -122,6 +122,20 @@ describe('config loading', () => {
     expect(config.sessionsDir).toBe('/default/sessions');
   });
 
+  it("uses Discord's default 10 MiB per-file upload limit when unset", async () => {
+    const homeDir = createTempDir();
+    const workDir = createTempDir();
+
+    process.chdir(workDir);
+    process.env.HOME = homeDir;
+    delete process.env.PIDG_CONFIG;
+    delete process.env.MAX_ATTACHMENT_BYTES;
+
+    const { config } = await loadConfigModule();
+
+    expect(config.maxAttachmentBytes).toBe(10 * 1024 * 1024);
+  });
+
   it('uses the piscord platform data directory defaults when storage paths are unset', async () => {
     const homeDir = createTempDir();
     const workDir = createTempDir();

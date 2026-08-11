@@ -210,7 +210,7 @@ Most users won't need to edit this file directly — `piscord setup` generates i
 | `SHUTDOWN_TIMEOUT_MS`        | `15000`                         | Graceful shutdown timeout (ms)                                             |
 | `AUTO_REGISTER_DMS`          | `true`                          | Auto-register DM channels                                                  |
 | `ARCHIVE_RETENTION_DAYS`     | `30`                            | Days to keep archived sessions (0 = never clean)                           |
-| `MAX_ATTACHMENT_BYTES`       | `26214400`                      | Max size per attachment (0 = no limit)                                     |
+| `MAX_ATTACHMENT_BYTES`       | `10485760`                      | Max size per attachment (Discord default: 10 MiB; 0 = no limit)            |
 | `MAX_TOTAL_ATTACHMENT_BYTES` | `52428800`                      | Max combined attachment size (0 = no limit)                                |
 | `SESSIONS_DIR`               | _(platform default)_/sessions   | Session storage directory (see Data Locations)                             |
 | `DB_PATH`                    | _(platform default)_/gateway.db | SQLite database path (see Data Locations)                                  |
