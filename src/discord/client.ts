@@ -38,6 +38,7 @@ import {
 import { handleAutocomplete, handleChatCommand, registerGlobalCommands } from './slash-commands.js';
 import { isChannelProcessing, interruptChannelTask } from '../agent/queue.js';
 import { rpcSessionIsStreaming, steerRpcSession } from '../agent/rpc-session.js';
+import { formatAttachmentTooLargeNotice, isAttachmentTooLargeError } from './send.js';
 
 let client: Client | null = null;
 let triggerPattern: RegExp;
@@ -421,39 +422,64 @@ export async function sendFilesResponse(
     }
     const textChannel = channel as TextChannel | DMChannel;
 
-    const valid: string[] = [];
+    const valid: Array<{ path: string; size: number }> = [];
+    const notices: string[] = [];
     for (const f of files) {
       try {
         const size = statSync(f).size;
         if (config.maxAttachmentBytes > 0 && size > config.maxAttachmentBytes) {
           logger.warn({ jid, file: f, size }, 'Skipping attachment over size limit');
+          notices.push(
+            formatAttachmentTooLargeNotice(basename(f), size, config.maxAttachmentBytes),
+          );
         } else {
-          valid.push(f);
+          valid.push({ path: f, size });
         }
       } catch {
         logger.warn({ jid, file: f }, 'Attachment not readable, skipping');
       }
     }
 
+    const responseText = [text, ...notices].filter(Boolean).join('\n\n');
     const attachments = await Promise.all(
-      valid.map(async (f) => new AttachmentBuilder(await readFile(f), { name: basename(f) })),
+      valid.map(
+        async ({ path }) => new AttachmentBuilder(await readFile(path), { name: basename(path) }),
+      ),
     );
 
     // Fall back to a plain text reply if nothing attachable survived.
     if (attachments.length === 0) {
-      return sendResponse(jid, text || '(empty response)');
+      return sendResponse(jid, responseText || '(empty response)');
     }
 
-    const body: string | undefined = text && text.length > 0 ? text : undefined;
+    const body: string | undefined = responseText.length > 0 ? responseText : undefined;
+    let finalBody = body;
     if (body && body.length > DISCORD_MAX_LENGTH) {
       // Send the long text in chunks; attach files to the final chunk.
       const chunks = splitMessage(body, DISCORD_MAX_LENGTH);
       for (let i = 0; i < chunks.length - 1; i++) {
         await textChannel.send(chunks[i]);
       }
-      await textChannel.send({ content: chunks[chunks.length - 1], files: attachments });
-    } else {
-      await textChannel.send({ content: body, files: attachments });
+      finalBody = chunks[chunks.length - 1];
+    }
+
+    try {
+      await textChannel.send({ content: finalBody, files: attachments });
+    } catch (err) {
+      if (!isAttachmentTooLargeError(err)) throw err;
+
+      const rejectedNotices = valid.map(({ path, size }) =>
+        formatAttachmentTooLargeNotice(basename(path), size),
+      );
+      const fallback = [finalBody, ...rejectedNotices].filter(Boolean).join('\n\n');
+      for (const chunk of splitMessage(fallback, DISCORD_MAX_LENGTH)) {
+        await textChannel.send(chunk);
+      }
+      logger.warn(
+        { jid, files: valid.map(({ path }) => path) },
+        'Discord rejected oversized attachments; sent a text notice instead',
+      );
+      return true;
     }
 
     logger.info(

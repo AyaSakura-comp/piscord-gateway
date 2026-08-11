@@ -1,5 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
-import { normalizeChannelJid, validateSendRequest, type SendRequest } from '../src/discord/send.js';
+import {
+  formatAttachmentTooLargeNotice,
+  isAttachmentTooLargeError,
+  normalizeChannelJid,
+  validateSendRequest,
+  type SendRequest,
+} from '../src/discord/send.js';
 
 function request(files: string[], text?: string): SendRequest {
   return {
@@ -16,6 +22,32 @@ describe('normalizeChannelJid', () => {
 
   it('keeps an existing dc: prefix', () => {
     expect(normalizeChannelJid('dc:123')).toBe('dc:123');
+  });
+});
+
+describe('formatAttachmentTooLargeNotice', () => {
+  it('tells the user which file exceeded the known attachment limit', () => {
+    expect(formatAttachmentTooLargeNotice('movie.mp4', 10_875_048, 10_485_760)).toBe(
+      '⚠️ 無法上傳「movie.mp4」（10.37 MiB）：超過 Discord 附件上限 10.00 MiB，請壓縮後再試。',
+    );
+  });
+
+  it('reports Discord rejection when its channel-specific limit is unknown', () => {
+    expect(formatAttachmentTooLargeNotice('movie.mp4', 10_875_048)).toBe(
+      '⚠️ 無法上傳「movie.mp4」（10.37 MiB）：超過 Discord 此頻道的附件大小限制，請壓縮後再試。',
+    );
+  });
+});
+
+describe('isAttachmentTooLargeError', () => {
+  it('recognizes Discord error code 40005', () => {
+    expect(isAttachmentTooLargeError({ code: 40005, message: 'Request entity too large' })).toBe(
+      true,
+    );
+  });
+
+  it('does not hide unrelated send failures', () => {
+    expect(isAttachmentTooLargeError(new Error('Missing permissions'))).toBe(false);
   });
 });
 
