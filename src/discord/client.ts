@@ -37,7 +37,8 @@ import {
 } from './attachments.js';
 import { handleAutocomplete, handleChatCommand, registerGlobalCommands } from './slash-commands.js';
 import { isChannelProcessing, interruptChannelTask } from '../agent/queue.js';
-import { rpcSessionIsStreaming, steerRpcSession } from '../agent/rpc-session.js';
+import { persistAndSteerMessage } from '../agent/durable-steer.js';
+import { rpcSessionIsStreaming } from '../agent/rpc-session.js';
 import { formatAttachmentTooLargeNotice, isAttachmentTooLargeError } from './send.js';
 
 let client: Client | null = null;
@@ -319,19 +320,36 @@ async function handleMessage(message: Message): Promise<void> {
   // ── Steer (RPC mode) ──
   // With a persistent RPC session, a message that arrives mid-turn is steered
   // INTO the running turn (redirect the agent in-flight) rather than killing it.
-  // The steered message is not enqueued — it becomes part of the current turn.
+  // Persist the steered message before injection. If the RPC process dies,
+  // its row is returned to pending and the normal queue will replay it.
+  // Attachments remain on the normal queue because RPC steer currently carries text only.
   const targetFolder = getChannel(targetJid)?.folder;
-  if (config.rpcSteer && targetFolder && rpcSessionIsStreaming(targetFolder)) {
+  if (
+    config.rpcSteer &&
+    targetFolder &&
+    acceptedAttachments.length === 0 &&
+    rpcSessionIsStreaming(targetFolder)
+  ) {
     const steerText = `[Discord user: ${senderName}]\n${content}`;
-    if (steerRpcSession(targetFolder, steerText)) {
-      logger.info({ jid: targetJid }, 'Steered new message into in-flight turn');
+    const steered = persistAndSteerMessage(targetFolder, steerText, {
+      channelJid: targetJid,
+      sender,
+      senderName,
+      content,
+      timestamp,
+      attachments: attachmentsJson,
+    });
+    if (steered) {
+      logger.info({ jid: targetJid }, 'Persisted and steered new message into in-flight turn');
       try {
         await message.react('⏩');
       } catch {
         // reaction is best-effort; ignore permission errors
       }
-      return;
+    } else {
+      logger.info({ jid: targetJid }, 'RPC turn settled during steering; message left pending');
     }
+    return;
   }
 
   // ── Interrupt (print mode) ──

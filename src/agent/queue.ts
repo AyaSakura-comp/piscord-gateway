@@ -12,6 +12,7 @@ import {
   channelsWithPending,
   claimNextMessage,
   clearPendingMessages,
+  markMessageAborted,
   markMessageDone,
   markMessageFailed,
   recoverStuckMessages,
@@ -19,7 +20,7 @@ import {
   getChannel,
 } from '../db.js';
 import { invokeAgent, UNTIL_DONE_MARKER } from './invoke.js';
-import { getRpcSession, closeAllRpcSessions } from './rpc-session.js';
+import { abortRpcSession, getRpcSession, closeAllRpcSessions } from './rpc-session.js';
 import { parseOutboxMarkers } from './outbox.js';
 import { sendResponse, sendFilesResponse, setTyping } from '../discord/client.js';
 import { createEventStreamer } from '../discord/stream-events.js';
@@ -47,6 +48,22 @@ export function abortChannelTask(jid: string): { aborted: boolean; cleared: numb
   }
   const cleared = clearPendingMessages(jid);
   return { aborted, cleared };
+}
+
+/** Stop the active turn, preferring Pi's session-preserving RPC abort. */
+export function stopChannelTask(jid: string): {
+  aborted: boolean;
+  cleared: number;
+  preservedSession: boolean;
+} {
+  const channel = getChannel(jid);
+  if (channel && abortRpcSession(channel.folder)) {
+    return { aborted: true, cleared: 0, preservedSession: true };
+  }
+
+  const controller = activeChannelControllers.get(jid);
+  if (controller) controller.abort();
+  return { aborted: Boolean(controller), cleared: 0, preservedSession: false };
 }
 
 /**
@@ -266,6 +283,12 @@ async function processMessage(
     if (signal.aborted) {
       markMessageFailed(rowid);
       logger.info({ jid, rowid }, 'Message abandoned: shutdown interrupted processing');
+      return;
+    }
+
+    if (result.aborted) {
+      markMessageAborted(rowid);
+      logger.info({ jid, rowid }, 'Message processing aborted with session preserved');
       return;
     }
 

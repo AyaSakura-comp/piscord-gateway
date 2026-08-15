@@ -227,27 +227,35 @@ function rowToChannel(row: any): RegisteredChannel {
 
 // ── Message queue ──
 
-export function enqueueMessage(msg: {
-  channelJid: string;
-  sender: string;
-  senderName: string;
-  content: string;
-  timestamp: string;
-  attachments?: string | null;
-}): void {
-  db.prepare(
-    `
-    insert into message_queue (channel_jid, sender, sender_name, content, timestamp, attachments)
-    values (?, ?, ?, ?, ?, ?)
-  `,
-  ).run(
-    msg.channelJid,
-    msg.sender,
-    msg.senderName,
-    msg.content,
-    msg.timestamp,
-    msg.attachments ?? null,
-  );
+export function enqueueMessage(
+  msg: {
+    channelJid: string;
+    sender: string;
+    senderName: string;
+    content: string;
+    timestamp: string;
+    attachments?: string | null;
+  },
+  options: { status?: 'pending' | 'steered' } = {},
+): number {
+  const result = db
+    .prepare(
+      `
+      insert into message_queue
+        (channel_jid, sender, sender_name, content, timestamp, attachments, status)
+      values (?, ?, ?, ?, ?, ?, ?)
+    `,
+    )
+    .run(
+      msg.channelJid,
+      msg.sender,
+      msg.senderName,
+      msg.content,
+      msg.timestamp,
+      msg.attachments ?? null,
+      options.status ?? 'pending',
+    );
+  return Number(result.lastInsertRowid);
 }
 
 export function claimNextMessage(channelJid: string): QueuedMessage | undefined {
@@ -285,6 +293,18 @@ export function markMessageFailed(rowid: number): void {
   ).run(rowid);
 }
 
+export function markMessageAborted(rowid: number): void {
+  db.prepare(
+    "update message_queue set status = 'aborted', processed_at = datetime('now') where rowid = ?",
+  ).run(rowid);
+}
+
+export function markMessagePending(rowid: number): void {
+  db.prepare(
+    "update message_queue set status = 'pending', processed_at = null where rowid = ?",
+  ).run(rowid);
+}
+
 export function clearPendingMessages(channelJid: string): number {
   const result = db
     .prepare("delete from message_queue where channel_jid = ? and status = 'pending'")
@@ -294,7 +314,9 @@ export function clearPendingMessages(channelJid: string): number {
 
 export function recoverStuckMessages(): number {
   const result = db
-    .prepare("update message_queue set status = 'pending' where status = 'processing'")
+    .prepare(
+      "update message_queue set status = 'pending', processed_at = null where status in ('processing', 'steered')",
+    )
     .run();
   return result.changes;
 }

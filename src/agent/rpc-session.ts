@@ -30,12 +30,22 @@ export interface RpcSessionOpts {
   cwd?: string;
 }
 
+export interface RpcSteerHooks {
+  onSettled: () => void;
+  onFailed: (error: Error) => void;
+}
+
 interface PendingTurn {
   onEvent?: (event: any) => void | Promise<void>;
   inAssistant: boolean;
   currentAssistantText: string;
   lastAssistantText: string;
   lastError: string;
+  userPromptPersisted: boolean;
+  abortRequested: boolean;
+  abortSent: boolean;
+  aborted: boolean;
+  steerHooks: RpcSteerHooks[];
   resolve: (result: AgentResult) => void;
 }
 
@@ -53,7 +63,10 @@ class RpcSession {
   ) {}
 
   get isStreaming(): boolean {
-    return this.streaming;
+    // A prompt is steer-able as soon as it has been written to the RPC process.
+    // Waiting for agent_start leaves a startup race where a rapid follow-up
+    // falls back to killing the process before the first prompt is persisted.
+    return this.streaming || Boolean(this.pending);
   }
 
   get isAlive(): boolean {
@@ -121,12 +134,16 @@ class RpcSession {
       if (event.type === 'message_start' && event.message?.role === 'assistant') {
         turn.inAssistant = true;
         turn.currentAssistantText = '';
+      } else if (event.type === 'message_end' && event.message?.role === 'user') {
+        turn.userPromptPersisted = true;
+        if (turn.abortRequested) this.sendAbort(turn);
       } else if (event.type === 'message_end' && turn.inAssistant) {
         const fromMessage = (event.message?.content ?? [])
           .filter((c: any) => c?.type === 'text')
           .map((c: any) => c.text)
           .join('');
         turn.lastAssistantText = fromMessage || turn.currentAssistantText;
+        turn.aborted = event.message?.stopReason === 'aborted';
         turn.inAssistant = false;
       } else if (event.type === 'message_update' && turn.inAssistant) {
         const ev = event.assistantMessageEvent;
@@ -139,7 +156,10 @@ class RpcSession {
     }
 
     if (event.type === 'agent_start' || event.type === 'turn_start') this.streaming = true;
-    if (event.type === 'agent_end') {
+    // agent_end only closes one low-level run. Retry, compaction, or a queued
+    // steering continuation may start another run immediately afterward.
+    // agent_settled is the authoritative end of the whole session-level turn.
+    if (event.type === 'agent_settled') {
       this.streaming = false;
       this.finishTurn();
     }
@@ -149,7 +169,16 @@ class RpcSession {
     const turn = this.pending;
     if (!turn) return;
     this.pending = undefined;
-    if (!turn.lastAssistantText && turn.lastError) {
+    for (const hooks of turn.steerHooks) {
+      try {
+        hooks.onSettled();
+      } catch (error) {
+        logger.warn({ folder: this.folder, err: String(error) }, 'RPC steer settle hook failed');
+      }
+    }
+    if (turn.aborted) {
+      turn.resolve({ ok: false, text: '', error: 'Agent invocation aborted', aborted: true });
+    } else if (!turn.lastAssistantText && turn.lastError) {
       turn.resolve({ ok: false, text: '', error: formatStreamError(turn.lastError) });
     } else {
       turn.resolve({ ok: true, text: turn.lastAssistantText || '(empty response)' });
@@ -166,13 +195,30 @@ class RpcSession {
     // isn't left hanging; the next prompt respawns the session.
     if (this.pending) {
       const turn = this.pending;
+      const error = new Error(`pi rpc session exited (code ${code})`);
       this.pending = undefined;
-      turn.resolve({ ok: false, text: '', error: `pi rpc session exited (code ${code})` });
+      for (const hooks of turn.steerHooks) {
+        try {
+          hooks.onFailed(error);
+        } catch (hookError) {
+          logger.warn(
+            { folder: this.folder, err: String(hookError) },
+            'RPC steer failure hook failed',
+          );
+        }
+      }
+      turn.resolve({ ok: false, text: '', error: error.message });
     }
   }
 
   private send(cmd: object): void {
     this.proc?.stdin?.write(JSON.stringify(cmd) + '\n');
+  }
+
+  private sendAbort(turn: PendingTurn): void {
+    if (turn.abortSent) return;
+    turn.abortSent = true;
+    this.send({ type: 'abort' });
   }
 
   private armIdleTimer(): void {
@@ -194,10 +240,7 @@ class RpcSession {
   }
 
   /** Run a new turn. Must only be called when not already streaming. */
-  prompt(
-    message: string,
-    onEvent?: (event: any) => void | Promise<void>,
-  ): Promise<AgentResult> {
+  prompt(message: string, onEvent?: (event: any) => void | Promise<void>): Promise<AgentResult> {
     this.ensureProc();
     this.clearIdleTimer();
     return new Promise<AgentResult>((resolve) => {
@@ -207,6 +250,11 @@ class RpcSession {
         currentAssistantText: '',
         lastAssistantText: '',
         lastError: '',
+        userPromptPersisted: false,
+        abortRequested: false,
+        abortSent: false,
+        aborted: false,
+        steerHooks: [],
         resolve,
       };
       this.send({ type: 'prompt', message });
@@ -214,9 +262,19 @@ class RpcSession {
   }
 
   /** Inject a message into the running turn (redirect the agent in-flight). */
-  steer(message: string): boolean {
-    if (!this.isAlive) return false;
+  steer(message: string, hooks?: RpcSteerHooks): boolean {
+    if (!this.isAlive || !this.pending) return false;
+    if (hooks) this.pending.steerHooks.push(hooks);
     this.send({ type: 'steer', message });
+    return true;
+  }
+
+  /** Abort after Pi has persisted the active user prompt in the session. */
+  requestAbort(): boolean {
+    const turn = this.pending;
+    if (!this.isAlive || !turn) return false;
+    turn.abortRequested = true;
+    if (turn.userPromptPersisted) this.sendAbort(turn);
     return true;
   }
 
@@ -261,10 +319,16 @@ export function rpcSessionIsStreaming(folder: string): boolean {
 }
 
 /** Steer a message into the running turn. Returns false if not steer-able. */
-export function steerRpcSession(folder: string, message: string): boolean {
+export function steerRpcSession(folder: string, message: string, hooks?: RpcSteerHooks): boolean {
   const session = sessions.get(keyFor(folder));
   if (!session || !session.isAlive || !session.isStreaming) return false;
-  return session.steer(message);
+  return session.steer(message, hooks);
+}
+
+/** Abort an active RPC turn without terminating its persistent Pi process. */
+export function abortRpcSession(folder: string): boolean {
+  const session = sessions.get(keyFor(folder));
+  return session?.requestAbort() ?? false;
 }
 
 /** Shut down every RPC session (graceful gateway stop). */

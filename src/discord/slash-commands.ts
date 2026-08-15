@@ -46,7 +46,7 @@ import {
   getDesiredThinkingLevel,
   type EffectiveChannelSettings,
 } from '../agent/channel-settings.js';
-import { abortChannelTask, isChannelProcessing } from '../agent/queue.js';
+import { isChannelProcessing, stopChannelTask } from '../agent/queue.js';
 import { rotateChannelSessionDir } from '../session/path.js';
 import type { RegisteredChannel } from '../types.js';
 
@@ -98,7 +98,10 @@ const PI_COMMAND = new SlashCommandBuilder()
   .addSubcommand((sub) =>
     sub
       .setName('stop')
-      .setDescription('Abort the current task and clear the queue for this channel'),
+      .setDescription('Abort the current task while preserving the session and queue'),
+  )
+  .addSubcommand((sub) =>
+    sub.setName('clear').setDescription('Delete queued messages without aborting the current task'),
   )
   .addSubcommand((sub) =>
     sub
@@ -136,7 +139,9 @@ const UNTIL_COMMAND = new SlashCommandBuilder()
     sub.setName('status').setDescription('Ask pi to report progress on the current goal'),
   )
   .addSubcommand((sub) =>
-    sub.setName('stop').setDescription('Abort the current task and clear the queue for this channel'),
+    sub
+      .setName('stop')
+      .setDescription('Abort the current task while preserving the session and queue'),
   );
 
 const GPT_USAGE_COMMAND = new SlashCommandBuilder()
@@ -219,6 +224,9 @@ export async function handleChatCommand(interaction: ChatInputCommandInteraction
       case 'stop':
         await handleStop(interaction);
         return;
+      case 'clear':
+        await handleClear(interaction);
+        return;
       case 'cwd':
         await handleCwdSet(interaction);
         return;
@@ -285,7 +293,7 @@ async function handleNew(interaction: ChatInputCommandInteraction): Promise<void
 
 async function handleStop(interaction: ChatInputCommandInteraction): Promise<void> {
   const jid = `dc:${interaction.channelId}`;
-  const result = abortChannelTask(jid);
+  const result = stopChannelTask(jid);
 
   if (!result.aborted && result.cleared === 0) {
     await interaction.reply(
@@ -305,6 +313,21 @@ async function handleStop(interaction: ChatInputCommandInteraction): Promise<voi
   }
 
   await interaction.reply(reply(notes.join(' '), interaction));
+}
+
+async function handleClear(interaction: ChatInputCommandInteraction): Promise<void> {
+  const channel = ensureManagedChannel(interaction);
+  if (!channel) {
+    await interaction.reply(reply(notRegisteredMessage(), interaction));
+    return;
+  }
+
+  const cleared = clearPendingMessages(channel.jid);
+  const message =
+    cleared === 0
+      ? 'No queued messages in this channel.'
+      : `Cleared ${cleared} queued ${cleared === 1 ? 'message' : 'messages'}.`;
+  await interaction.reply(reply(message, interaction));
 }
 
 async function handleUntilGoal(interaction: ChatInputCommandInteraction): Promise<void> {
