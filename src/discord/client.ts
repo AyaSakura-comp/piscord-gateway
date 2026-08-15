@@ -298,16 +298,7 @@ async function handleMessage(message: Message): Promise<void> {
       });
       targetJid = `dc:${thread.id}`;
       if (!getChannel(targetJid)) {
-        const threadReg: RegisteredChannel = {
-          jid: targetJid,
-          name: `${channel.name} ▸ ${thread.name}`,
-          folder: `ch_${thread.id}`,
-          requiresTrigger: false,
-          isMain: false,
-          modelOverride: channel.modelOverride,
-          thinkingOverride: channel.thinkingOverride,
-          cwdOverride: channel.cwdOverride,
-        };
+        const threadReg = createAutoThreadRegistration(channel, thread.id, thread.name);
         dbRegisterChannel(threadReg);
         logger.info({ jid: targetJid, name: threadReg.name }, 'Opened and registered thread');
       }
@@ -555,6 +546,23 @@ function splitMessage(text: string, max: number): string[] {
 
 function escapeRegExp(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+export function createAutoThreadRegistration(
+  parent: RegisteredChannel,
+  threadId: string,
+  threadName: string,
+): RegisteredChannel {
+  return {
+    jid: `dc:${threadId}`,
+    name: `${parent.name} ▸ ${threadName}`,
+    folder: `ch_${threadId}`,
+    requiresTrigger: false,
+    isMain: false,
+    modelOverride: parent.modelOverride,
+    thinkingOverride: 'medium',
+    cwdOverride: parent.cwdOverride,
+  };
 }
 
 /** Build a Discord-safe thread title (max 100 chars) from sender + message. */
