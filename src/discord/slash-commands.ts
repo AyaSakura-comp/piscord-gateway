@@ -47,6 +47,7 @@ import {
   type EffectiveChannelSettings,
 } from '../agent/channel-settings.js';
 import { isChannelProcessing, stopChannelTask } from '../agent/queue.js';
+import { closeRpcSession } from '../agent/rpc-session.js';
 import { rotateChannelSessionDir } from '../session/path.js';
 import type { RegisteredChannel } from '../types.js';
 
@@ -273,10 +274,16 @@ async function handleNew(interaction: ChatInputCommandInteraction): Promise<void
   }
 
   const cleared = clearPendingMessages(channel.jid);
+
+  // Retire the warm RPC process BEFORE moving the directory out from under it.
+  // It holds `--session-dir` plus an already-resolved session file; leaving it
+  // alive across the rename makes the next prompt fail with ENOENT on a .jsonl
+  // that now lives in the archive. The next message simply spawns a fresh one.
+  const closedRpc = closeRpcSession(channel.folder);
   const archivedSession = rotateChannelSessionDir(channel.folder);
 
   logger.info(
-    { jid: channel.jid, cleared, archived: Boolean(archivedSession) },
+    { jid: channel.jid, cleared, archived: Boolean(archivedSession), closedRpc },
     'Channel session reset',
   );
 
