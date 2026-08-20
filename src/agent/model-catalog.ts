@@ -2,6 +2,7 @@ import { AuthStorage, ModelRegistry } from '@earendil-works/pi-coding-agent';
 import type { Model } from '@earendil-works/pi-ai';
 import { THINKING_LEVELS, type ThinkingLevel } from '../types.js';
 import { supportsModelXhigh } from './pi-ai-compat.js';
+import { cachedAgyModels, listAgyModels } from './agy.js';
 
 const CACHE_TTL_MS = 30_000;
 
@@ -35,9 +36,14 @@ export function listAvailableModels(options?: { forceRefresh?: boolean }): Avail
   const registry = createModelRegistry(authStorage);
   registry.refresh();
 
+  // agy is a separate CLI, so its catalog is fetched out of band and merged
+  // from cache. Kick off a refresh here and use whatever the last one produced.
+  void listAgyModels({ forceRefresh });
+
   const models = registry
     .getAvailable()
     .map(toAvailableModelInfo)
+    .concat(cachedAgyModels())
     .sort((a, b) => a.ref.localeCompare(b.ref));
 
   cache = { loadedAt: now, models };
@@ -203,3 +209,6 @@ function scoreModelMatch(model: AvailableModelInfo, rawQuery: string): number {
   if (normalize(model.name).includes(normalizedQuery)) score += 60;
   return score;
 }
+
+// Populate the agy catalog at startup so the first model list already has it.
+void listAgyModels();

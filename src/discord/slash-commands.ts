@@ -48,6 +48,7 @@ import {
 } from '../agent/channel-settings.js';
 import { isChannelProcessing, stopChannelTask } from '../agent/queue.js';
 import { closeRpcSession } from '../agent/rpc-session.js';
+import { getAgyUsageReport } from '../agy-usage.js';
 import { rotateChannelSessionDir } from '../session/path.js';
 import type { RegisteredChannel } from '../types.js';
 
@@ -120,6 +121,9 @@ const PI_COMMAND = new SlashCommandBuilder()
   )
   .addSubcommand((sub) =>
     sub.setName('gpt-usage').setDescription('Show ChatGPT/Codex subscription rate-limit usage'),
+  )
+  .addSubcommand((sub) =>
+    sub.setName('agy-usage').setDescription('Show Antigravity (Gemini) quota usage'),
   );
 
 const UNTIL_COMMAND = new SlashCommandBuilder()
@@ -236,6 +240,9 @@ export async function handleChatCommand(interaction: ChatInputCommandInteraction
         return;
       case 'gpt-usage':
         await handleGptUsage(interaction);
+        return;
+      case 'agy-usage':
+        await handleAgyUsage(interaction);
         return;
       default:
         await interaction.reply(reply(`Unknown subcommand: ${subcommand}`, interaction));
@@ -664,6 +671,17 @@ function reply(content: string, interaction: ChatInputCommandInteraction): Inter
 }
 
 const execAsync = promisify(exec);
+
+async function handleAgyUsage(interaction: ChatInputCommandInteraction): Promise<void> {
+  await interaction.deferReply(
+    interaction.inGuild() ? { flags: MessageFlags.Ephemeral } : undefined,
+  );
+
+  // getAgyUsageReport never throws; it renders its own failure text so a missing
+  // or expired agy login reads as an explanation rather than a stack trace.
+  const output = await getAgyUsageReport();
+  await interaction.editReply({ content: `\`\`\`text\n${output.trim()}\n\`\`\`` });
+}
 
 async function handleGptUsage(interaction: ChatInputCommandInteraction): Promise<void> {
   await interaction.deferReply(

@@ -139,6 +139,34 @@ export const config = {
   /** Pi binary path */
   piBin: env('PI_BIN', 'pi'),
 
+  /**
+   * Google Antigravity (`agy`) bridge. When enabled, `agy models` are offered
+   * as `agy/<id>` refs and every turn on such a model is delegated to the agy
+   * CLI instead of pi.
+   */
+  agyEnabled: envBool('AGY_ENABLED', true),
+
+  /** agy binary path. The systemd unit does not inherit ~/.local/bin. */
+  agyBin: env('AGY_BIN', 'agy'),
+
+  /** Timeout for the `agy models` catalog probe */
+  agyModelsTimeoutMs: envInt('AGY_MODELS_TIMEOUT_MS', 20000, { min: 1000 }),
+
+  /**
+   * Passed to agy as --print-timeout. A middle ground: too low kills legitimate
+   * long work, unbounded turns a wedged foreground tool into a locked session.
+   */
+  agyPrintTimeout: env('AGY_PRINT_TIMEOUT', '60m'),
+
+  /**
+   * agy blocks on interactive tool-permission prompts and there is no UI here
+   * to answer them, so auto-approval is on by default.
+   */
+  agySkipPermissions: envBool('AGY_SKIP_PERMISSIONS', true),
+
+  /** How long a single agy tool call may run before the transcript says so. */
+  agyToolStallWarnMs: envInt('AGY_TOOL_STALL_WARN_MS', 120_000, { min: 5_000 }),
+
   /** Default model for pi */
   piModel: env('PI_MODEL'),
 
