@@ -394,6 +394,8 @@ const LIVE_EDIT_MS = 1500;
 interface LiveMessage {
   /** The message being written into. Undefined once sealed (see below). */
   message?: Message;
+  /** Every message this reply created, so a bad preview can be withdrawn. */
+  messages: Message[];
   channel: TextChannel | DMChannel;
   /** Text already committed to `message`. */
   shown: string;
@@ -414,6 +416,20 @@ const liveMessages = new Map<string, LiveMessage>();
  * finalised before any send landed, so the reply was posted twice.
  */
 const liveOpening = new Map<string, Promise<void>>();
+
+/**
+ * Turns whose reply has already been settled. The streamer feeds updates
+ * through its own queue while the queue module finalises off it, so an update
+ * can still be in flight when the reply is delivered — it would open a fresh
+ * message that nothing ever finalises, leaving a stray half-reply in the
+ * channel next to the real one.
+ */
+const liveClosed = new Set<string>();
+
+/** Start a turn: allow streaming into this channel again. */
+export function beginLiveResponse(jid: string): void {
+  liveClosed.delete(jid);
+}
 
 /**
  * How many characters of the source a committed message accounts for.
@@ -457,6 +473,7 @@ async function pushLive(jid: string, full: string): Promise<void> {
     slice = liveSlice(live, full);
     const next = splitMessage(slice, DISCORD_MAX_LENGTH)[0] || '…';
     live.message = await live.channel.send(next);
+    live.messages.push(live.message);
     live.shown = next;
     live.lastEditAt = Date.now();
   }
@@ -485,6 +502,7 @@ async function openLive(jid: string, full: string): Promise<void> {
     logger.info({ jid, resumed: Boolean(existing) }, 'Streaming reply opened');
     liveMessages.set(jid, {
       message,
+      messages: [...(existing?.messages ?? []), message],
       channel,
       shown: body,
       latest: full,
@@ -503,7 +521,7 @@ async function awaitLiveOpen(jid: string): Promise<void> {
 
 /** Feed the growing reply. Safe to call per delta; edits are throttled. */
 export async function updateLiveResponse(jid: string, full: string): Promise<void> {
-  if (!client || !full.trim()) return;
+  if (!client || !full.trim() || liveClosed.has(jid)) return;
 
   const known = liveMessages.get(jid);
   if (known) known.latest = full;
@@ -590,16 +608,42 @@ export async function finishLiveResponse(jid: string, finalText: string): Promis
   await awaitLiveOpen(jid);
   const live = liveMessages.get(jid);
   if (!live) return false;
-  liveMessages.delete(jid);
   if (live.timer) clearTimeout(live.timer);
 
   const body = finalText?.trim() ?? '';
   try {
     if (!body) {
       // The turn produced nothing deliverable; drop the preview rather than
-      // leaving a half-written sentence as the reply.
-      await live.message?.delete().catch(() => undefined);
+      // leaving a half-written sentence as the reply. Every message, not just
+      // the open one — a sealed reply has already spilled into several.
+      for (const message of live.messages) await message.delete().catch(() => undefined);
       return false;
+    }
+
+    // `consumed` indexes the STREAMED text, but `finalText` is produced
+    // separately by the queue. In a multi-run turn (text, tools, more text)
+    // those are not the same string, and slicing one by the other's offset
+    // re-sent a whole block of the answer beneath the copy already there.
+    const streamed = live.latest;
+    if (body.slice(0, live.consumed) !== streamed.slice(0, live.consumed)) {
+      // The usual reason: the queue hands back only the last run's text while
+      // the stream carried every run, so the reply is already complete on
+      // screen and the "final" text is its tail. Measured: streamed 505 chars,
+      // final 368, finalIsTail true. Flush and settle; re-sending would
+      // duplicate the answer.
+      if (streamed.trim().endsWith(body)) {
+        await pushLive(jid, streamed).catch((err) =>
+          logger.warn({ jid, err: err?.message }, 'live: final flush failed'),
+        );
+        logger.info({ jid, length: streamed.length }, 'Response finalised (streamed in full)');
+        return true;
+      }
+      logger.warn(
+        { jid, consumed: live.consumed, streamed: streamed.length, final: body.length },
+        'live: streamed text is unrelated to the final reply, withdrawing the preview',
+      );
+      for (const message of live.messages) await message.delete().catch(() => undefined);
+      return false; // the caller posts the whole reply normally
     }
 
     const rest = body.slice(live.consumed);
@@ -618,6 +662,10 @@ export async function finishLiveResponse(jid: string, finalText: string): Promis
   } catch (err: any) {
     logger.warn({ jid, err: err.message }, 'live: finalise failed, falling back to a new message');
     return false;
+  } finally {
+    // Kept in the map until here so the flush above can still reach it.
+    liveMessages.delete(jid);
+    liveClosed.add(jid);
   }
 }
 
@@ -626,9 +674,65 @@ export async function discardLiveResponse(jid: string): Promise<void> {
   await awaitLiveOpen(jid);
   const live = liveMessages.get(jid);
   if (!live) return;
+  liveClosed.add(jid);
   liveMessages.delete(jid);
   if (live.timer) clearTimeout(live.timer);
-  await live.message?.delete().catch(() => undefined);
+  for (const message of live.messages) await message.delete().catch(() => undefined);
+}
+
+/**
+ * The thinking block's message, reserved before its content exists.
+ *
+ * pi emits `thinking_start` as soon as the model begins reasoning but only
+ * emits `thinking_end` — the event carrying the text — when the whole assistant
+ * message completes, at the same millisecond as `text_end`. Measured on
+ * qwen3.6-35b: thinking_start at 18:22:08.401, text_start at 18:22:11.475,
+ * thinking_end at 18:22:12.957.
+ *
+ * A Discord message's position is fixed when it is created, so posting the
+ * thinking only once its text arrived put it below a reply that had started
+ * streaming three seconds earlier. Posting a placeholder at `thinking_start`
+ * claims the position while the reply is still unwritten, and the content is
+ * edited in later.
+ */
+const thinkingMessages = new Map<string, Message>();
+
+/** Claim the thinking block's position in the channel. */
+export async function openThinkingMessage(jid: string): Promise<void> {
+  if (!client || thinkingMessages.has(jid)) return;
+  try {
+    const channel = await client.channels.fetch(jid.replace(/^dc:/, ''));
+    if (!channel || !('send' in channel)) return;
+    const message = await (channel as TextChannel | DMChannel).send('💭 *Thinking…*');
+    thinkingMessages.set(jid, message);
+  } catch (err: any) {
+    logger.warn({ jid, err: err.message }, 'live: could not reserve the thinking message');
+  }
+}
+
+/**
+ * Fill in the reserved thinking message. Returns false when there is none, so
+ * the caller can fall back to sending it as a normal message.
+ */
+export async function finishThinkingMessage(jid: string, text: string): Promise<boolean> {
+  const message = thinkingMessages.get(jid);
+  if (!message) return false;
+  thinkingMessages.delete(jid);
+  try {
+    await message.edit(text.slice(0, DISCORD_MAX_LENGTH));
+    return true;
+  } catch (err: any) {
+    logger.warn({ jid, err: err.message }, 'live: could not fill the thinking message');
+    return false;
+  }
+}
+
+/** Remove a reserved thinking message whose content never arrived. */
+export async function discardThinkingMessage(jid: string): Promise<void> {
+  const message = thinkingMessages.get(jid);
+  if (!message) return;
+  thinkingMessages.delete(jid);
+  await message.delete().catch(() => undefined);
 }
 
 export async function sendResponse(

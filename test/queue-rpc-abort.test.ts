@@ -19,6 +19,7 @@ vi.mock('../src/discord/client.js', () => ({
   sendFilesResponse: vi.fn(),
   sendResponse: sendResponseMock,
   discardLiveResponse: vi.fn(),
+  discardThinkingMessage: vi.fn(),
   setTyping: setTypingMock,
 }));
 

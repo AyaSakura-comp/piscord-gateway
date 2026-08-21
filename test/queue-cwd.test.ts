@@ -17,6 +17,13 @@ vi.mock('../src/agent/invoke.js', async (importOriginal) => ({
 vi.mock('../src/discord/client.js', () => ({
   sendResponse: sendResponseMock,
   discardLiveResponse: vi.fn(),
+  beginLiveResponse: vi.fn(),
+  updateLiveResponse: vi.fn(),
+  sealLiveResponse: vi.fn(),
+  finishLiveResponse: vi.fn(),
+  openThinkingMessage: vi.fn(),
+  finishThinkingMessage: vi.fn(),
+  discardThinkingMessage: vi.fn(),
   setTyping: setTypingMock,
 }));
 

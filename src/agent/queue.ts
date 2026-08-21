@@ -25,6 +25,7 @@ import { abortRpcSession, getRpcSession, closeAllRpcSessions } from './rpc-sessi
 import { parseOutboxMarkers } from './outbox.js';
 import {
   discardLiveResponse,
+  discardThinkingMessage,
   sendResponse,
   sendFilesResponse,
   setTyping,
@@ -305,6 +306,7 @@ async function processMessage(
     // answer.
     if (signal.aborted) {
       void discardLiveResponse(jid);
+      void discardThinkingMessage(jid);
       markMessageFailed(rowid);
       logger.info({ jid, rowid }, 'Message abandoned: shutdown interrupted processing');
       return;
@@ -312,6 +314,7 @@ async function processMessage(
 
     if (result.aborted) {
       void discardLiveResponse(jid);
+      void discardThinkingMessage(jid);
       markMessageAborted(rowid);
       logger.info({ jid, rowid }, 'Message processing aborted with session preserved');
       return;

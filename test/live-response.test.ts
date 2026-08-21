@@ -56,7 +56,7 @@ describe('streamed Discord replies', () => {
     // An empty final text deletes the preview rather than leaving a
     // half-written sentence standing as the answer.
     const fin = CLIENT.slice(CLIENT.indexOf('export async function finishLiveResponse('));
-    expect(fin).toMatch(/if \(!body\) \{[\s\S]*?live\.message\?\.delete\(\)/);
+    expect(fin).toMatch(/if \(!body\) \{[\s\S]*?for \(const message of live\.messages\) await message\.delete\(\)/);
   });
 
   /**
@@ -313,5 +313,129 @@ describe('reply integrity across seals', () => {
     const messages = deliver(REPLY, [3000]);
     const first = messages[0];
     expect(messages.slice(1).some((m) => m.includes(first.slice(0, 200)))).toBe(false);
+  });
+});
+
+/**
+ * Measured on qwen3.6-35b through pi's RPC stream:
+ *
+ *   18:22:08.401  thinking_start
+ *   18:22:08-11   thinking_delta x140
+ *   18:22:11.475  text_start
+ *   18:22:11.933  reply message created
+ *   18:22:12.957  thinking_end   <- carries the text, same ms as text_end
+ *
+ * A Discord message's position is fixed when it is created, so posting the
+ * thinking when its text finally arrived put it below a reply that had started
+ * streaming three seconds earlier. thinking_start is the only early signal.
+ */
+describe('thinking blocks that resolve after the reply has started', () => {
+  it('claims the position at thinking_start, before any text exists', () => {
+    const block = EVENTS.slice(EVENTS.indexOf("=== 'thinking_start'"));
+    expect(block.slice(0, 400)).toContain('openThinkingMessage(jid)');
+    // On the ordered queue, like everything else that creates a message.
+    expect(block.slice(0, 400)).toContain('pending = pending');
+  });
+
+  it('fills that message at thinking_end rather than sending a new one', () => {
+    const block = EVENTS.slice(EVENTS.indexOf("=== 'thinking_end'"));
+    expect(block).toContain('finishThinkingMessage(jid, rendered)');
+    // Falls back to a plain send only when no reservation exists.
+    expect(block).toMatch(/if \(await finishThinkingMessage\(jid, rendered\)\) return;/);
+  });
+
+  it('reserves before the reply, so no seal splits the answer', () => {
+    // thinking_start precedes text_start, so the reply opens below the
+    // reservation and nothing needs to be sealed for it.
+    const start = EVENTS.indexOf("=== 'thinking_start'");
+    const end = EVENTS.indexOf("=== 'thinking_end'");
+    expect(start).toBeGreaterThan(0);
+    expect(start).toBeLessThan(end);
+  });
+
+  it('removes a reservation whose content never arrived', () => {
+    const QUEUE = readFileSync(resolve(__dirname, '../src/agent/queue.ts'), 'utf8');
+    expect(QUEUE.match(/void discardThinkingMessage\(jid\);/g)?.length).toBe(2);
+    expect(CLIENT).toContain('export async function discardThinkingMessage(');
+  });
+
+  it('keeps the reservation to one message per channel', () => {
+    const open = CLIENT.slice(CLIENT.indexOf('export async function openThinkingMessage('));
+    expect(open.slice(0, 300)).toContain('thinkingMessages.has(jid)');
+  });
+});
+
+/**
+ * `consumed` indexes the text that was STREAMED, but the text handed to
+ * finishLiveResponse is produced separately by the queue. In a multi-run turn
+ * — text, tool calls, more text — those are not the same string, and slicing
+ * one by the other's offset re-sent a whole block of the answer into the
+ * channel underneath the copy that was already there.
+ */
+describe('final text that differs from what was streamed', () => {
+  it('checks the offset is meaningful before slicing by it', () => {
+    const fin = CLIENT.slice(CLIENT.indexOf('export async function finishLiveResponse('));
+    expect(fin).toContain('body.slice(0, live.consumed) !== streamed.slice(0, live.consumed)');
+    // The check must precede the slice it guards.
+    expect(fin.indexOf('streamed.slice(0, live.consumed)')).toBeLessThan(
+      fin.indexOf('const rest = body.slice(live.consumed)'),
+    );
+  });
+
+  it('withdraws the preview and defers to the normal send on a mismatch', () => {
+    const fin = CLIENT.slice(CLIENT.indexOf('export async function finishLiveResponse('));
+    const guard = fin.slice(fin.indexOf('withdrawing the preview'));
+    expect(guard.slice(0, 300)).toContain('for (const message of live.messages) await message.delete()');
+    // false => sendResponse posts the whole reply itself.
+    expect(guard.slice(0, 300)).toContain('return false;');
+  });
+
+  it('keeps a handle on every message so all of them can be withdrawn', () => {
+    expect(CLIENT).toContain('messages: Message[]');
+    expect(CLIENT).toContain('live.messages.push(live.message)');
+    // A resumed message joins the same list rather than starting a new one.
+    expect(CLIENT).toContain('messages: [...(existing?.messages ?? []), message]');
+  });
+});
+
+/**
+ * Measured on a three-tool turn: streamed 505 chars, final 368, and the final
+ * text was the TAIL of the stream — the queue hands back only the last run's
+ * text while the stream carried every run. The reply is already complete on
+ * screen, so re-sending the "final" text would duplicate the answer.
+ */
+describe('multi-run turns where the final text is the tail of the stream', () => {
+  it('settles in place instead of re-sending the answer', () => {
+    const fin = CLIENT.slice(CLIENT.indexOf('export async function finishLiveResponse('));
+    const tail = fin.slice(fin.indexOf('streamed.trim().endsWith(body)'));
+    expect(tail.slice(0, 400)).toContain('pushLive(jid, streamed)');
+    expect(tail.slice(0, 400)).toContain('return true;');
+    // It must not delete anything in this branch — the answer is on screen.
+    expect(tail.slice(0, 400)).not.toContain('message.delete()');
+  });
+
+  it('checks the tail case before withdrawing anything', () => {
+    const fin = CLIENT.slice(CLIENT.indexOf('export async function finishLiveResponse('));
+    expect(fin.indexOf('streamed.trim().endsWith(body)')).toBeLessThan(
+      fin.indexOf('withdrawing the preview'),
+    );
+  });
+
+  it('keeps the entry alive until the flush has run', () => {
+    const fin = CLIENT.slice(CLIENT.indexOf('export async function finishLiveResponse('));
+    // Deleting on entry would make the flush a no-op: pushLive reads the map.
+    expect(fin.indexOf('pushLive(jid, streamed)')).toBeLessThan(
+      fin.indexOf('liveMessages.delete(jid)'),
+    );
+    expect(fin).toMatch(/} finally \{[\s\S]*?liveMessages\.delete\(jid\);/);
+  });
+
+  it('blocks updates that arrive after the reply was settled', () => {
+    expect(CLIENT).toContain('const liveClosed = new Set<string>()');
+    const update = CLIENT.slice(CLIENT.indexOf('export async function updateLiveResponse('));
+    expect(update.slice(0, 200)).toContain('liveClosed.has(jid)');
+    // And a new turn must clear it, or streaming stops after the first reply.
+    expect(CLIENT).toContain('export function beginLiveResponse(');
+    expect(EVENTS).toContain('beginLiveResponse(jid)');
   });
 });

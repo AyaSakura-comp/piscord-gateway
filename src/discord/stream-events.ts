@@ -12,7 +12,14 @@
 
 import { config } from '../config.js';
 import { logger } from '../logger.js';
-import { sealLiveResponse, sendResponse, updateLiveResponse } from './client.js';
+import {
+  beginLiveResponse,
+  finishThinkingMessage,
+  openThinkingMessage,
+  sealLiveResponse,
+  sendResponse,
+  updateLiveResponse,
+} from './client.js';
 
 /** Discord caps a single message at 2000 chars. We leave headroom for the prefix. */
 function truncate(s: string, cap: number): string {
@@ -74,6 +81,9 @@ export function createEventStreamer(
     return pending;
   };
 
+  // A new turn: re-open streaming for this channel (see beginLiveResponse).
+  beginLiveResponse(jid);
+
   // The reply as it is being written. Buffered here and pushed into the live
   // Discord message, which sendResponse later finalises in place.
   let liveText = '';
@@ -103,6 +113,23 @@ export function createEventStreamer(
     // per-turn, and an empty turn is cleaned up by finishLiveResponse.
 
     // ── Thinking blocks ─────────────────────────────────────────────────
+    // `thinking_start` fires as soon as the model begins reasoning, but the
+    // text only arrives on `thinking_end`, which pi emits when the whole
+    // assistant message completes — seconds after the reply started streaming.
+    // Claim the position now, on the same ordered queue as everything else, and
+    // fill it in below.
+    if (
+      config.streamThinking &&
+      event.type === 'message_update' &&
+      event.assistantMessageEvent?.type === 'thinking_start'
+    ) {
+      pending = pending
+        .then(() => sealLiveResponse(jid))
+        .then(() => openThinkingMessage(jid))
+        .catch((err) => logger.warn({ err: err?.message, jid }, 'stream-events: reserve failed'));
+      return;
+    }
+    // ── Thinking blocks ─────────────────────────────────────────────────
     // Each turn's thinking arrives as `*_start` / `*_delta` / `*_end`. We
     // fire only on `_end` (one Discord message per thinking block, not per
     // token), using the authoritative `content` field on the end event.
@@ -120,7 +147,17 @@ export function createEventStreamer(
           .split('\n')
           .map((l) => `> ${l}`)
           .join('\n');
-        enqueueSend(`💭 *Thinking:*\n${quoted}`);
+        const rendered = `💭 *Thinking:*\n${quoted}`;
+        // Fill the message reserved at thinking_start; only fall back to
+        // sending a new one if there was none (reservation failed, or the
+        // provider emits no thinking_start).
+        pending = pending
+          .then(async () => {
+            if (await finishThinkingMessage(jid, rendered)) return;
+            await sealLiveResponse(jid);
+            await sendResponse(jid, rendered, { settleLive: false });
+          })
+          .catch((err) => logger.warn({ err: err?.message, jid }, 'stream-events: send failed'));
       }
       return;
     }
