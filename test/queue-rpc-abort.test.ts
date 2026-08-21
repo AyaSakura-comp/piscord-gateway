@@ -18,6 +18,7 @@ vi.mock('../src/agent/rpc-session.js', () => ({
 vi.mock('../src/discord/client.js', () => ({
   sendFilesResponse: vi.fn(),
   sendResponse: sendResponseMock,
+  discardLiveResponse: vi.fn(),
   setTyping: setTypingMock,
 }));
 

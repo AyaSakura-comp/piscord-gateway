@@ -378,8 +378,196 @@ async function handleMessage(message: Message): Promise<void> {
 
 const DISCORD_MAX_LENGTH = 2000;
 
+/**
+ * Live (streaming) reply.
+ *
+ * Discord has no server-push, so "streaming" means editing one message as the
+ * text grows. Edits are rate limited per channel, so they are throttled rather
+ * than sent per token — pi emits hundreds of deltas per reply and an unthrottled
+ * edit loop would be throttled into arriving *later* than a single send.
+ *
+ * The streamed message becomes the real reply: sendResponse finalises it with
+ * an edit instead of posting a second copy.
+ */
+const LIVE_EDIT_MS = 1500;
+
+interface LiveMessage {
+  message: Message;
+  /** Text already committed to `message`. */
+  shown: string;
+  /** Characters of the reply that earlier, already-full messages consumed. */
+  consumed: number;
+  lastEditAt: number;
+  timer?: NodeJS.Timeout;
+}
+
+const liveMessages = new Map<string, LiveMessage>();
+
+/** Text that belongs in the current message, given what earlier ones took. */
+function liveSlice(live: LiveMessage, full: string): string {
+  return full.slice(live.consumed);
+}
+
+async function pushLive(jid: string, full: string): Promise<void> {
+  const live = liveMessages.get(jid);
+  if (!live) return;
+
+  let slice = liveSlice(live, full);
+
+  // The current message is full: commit it at a line boundary and continue in
+  // a new one, so a long reply streams across several messages like a normal
+  // split reply rather than stopping at 2000 characters.
+  if (slice.length > DISCORD_MAX_LENGTH) {
+    const head = splitMessage(slice, DISCORD_MAX_LENGTH)[0];
+    try {
+      await live.message.edit(head);
+    } catch (err: any) {
+      logger.warn({ jid, err: err.message }, 'live: final edit of full message failed');
+    }
+    live.consumed += head.length;
+    slice = liveSlice(live, full);
+    const channel = live.message.channel as TextChannel | DMChannel;
+    live.message = await channel.send(slice.slice(0, DISCORD_MAX_LENGTH) || '…');
+    live.shown = slice.slice(0, DISCORD_MAX_LENGTH);
+    live.lastEditAt = Date.now();
+    return;
+  }
+
+  if (slice === live.shown || !slice) return;
+  await live.message.edit(slice);
+  live.shown = slice;
+  live.lastEditAt = Date.now();
+}
+
+/**
+ * Opening the first message is async, but callers fire-and-forget one call per
+ * delta and `finishLiveResponse` reads the map synchronously. Without a handle
+ * on the in-flight open, four rapid deltas each see an empty map (four
+ * messages), and a short reply finalises before any of them land, so the
+ * streamed message is orphaned and the reply gets posted twice. Everything that
+ * touches `liveMessages` awaits this first.
+ */
+const liveOpening = new Map<string, Promise<void>>();
+
+async function openLive(jid: string, full: string): Promise<void> {
+  const channelId = jid.replace(/^dc:/, '');
+  try {
+    const channel = await client!.channels.fetch(channelId);
+    if (!channel || !('send' in channel)) return;
+    const message = await (channel as TextChannel | DMChannel).send(
+      full.slice(0, DISCORD_MAX_LENGTH),
+    );
+    liveMessages.set(jid, {
+      message,
+      shown: full.slice(0, DISCORD_MAX_LENGTH),
+      consumed: 0,
+      lastEditAt: Date.now(),
+    });
+  } catch (err: any) {
+    logger.warn({ jid, err: err.message }, 'live: could not open streaming message');
+  }
+}
+
+/** Resolve once any in-flight first-message send has settled. */
+async function awaitLiveOpen(jid: string): Promise<void> {
+  await liveOpening.get(jid)?.catch(() => undefined);
+}
+
+/** Feed the growing reply. Safe to call per delta; edits are throttled. */
+export async function updateLiveResponse(jid: string, full: string): Promise<void> {
+  if (!client || !full.trim()) return;
+
+  if (!liveMessages.has(jid)) {
+    let opening = liveOpening.get(jid);
+    if (!opening) {
+      opening = openLive(jid, full);
+      liveOpening.set(jid, opening);
+      // The opening message already carries `full` as of this delta; later
+      // deltas fall through below and edit it with their newer text.
+      await opening.finally(() => {
+        if (liveOpening.get(jid) === opening) liveOpening.delete(jid);
+      });
+      return;
+    }
+    await awaitLiveOpen(jid);
+  }
+
+  const live = liveMessages.get(jid);
+  if (!live) return;
+
+  const wait = LIVE_EDIT_MS - (Date.now() - live.lastEditAt);
+  if (wait > 0) {
+    // Coalesce: keep only the newest text, one pending edit per channel.
+    if (live.timer) clearTimeout(live.timer);
+    live.timer = setTimeout(() => {
+      const current = liveMessages.get(jid);
+      if (!current) return;
+      current.timer = undefined;
+      void pushLive(jid, full).catch((err) =>
+        logger.warn({ jid, err: err?.message }, 'live: throttled edit failed'),
+      );
+    }, wait);
+    live.timer.unref?.();
+    return;
+  }
+
+  await pushLive(jid, full).catch((err) =>
+    logger.warn({ jid, err: err?.message }, 'live: edit failed'),
+  );
+}
+
+/**
+ * Settle the streamed message on the final text.
+ *
+ * Returns true when it delivered the reply, so the caller must not send it
+ * again. Any text beyond what the streamed messages hold is sent as follow-ups.
+ */
+export async function finishLiveResponse(jid: string, finalText: string): Promise<boolean> {
+  await awaitLiveOpen(jid);
+  const live = liveMessages.get(jid);
+  if (!live) return false;
+  liveMessages.delete(jid);
+  if (live.timer) clearTimeout(live.timer);
+
+  const body = finalText?.trim() ?? '';
+  try {
+    if (!body) {
+      // The turn produced nothing deliverable; drop the preview rather than
+      // leaving a half-written sentence as the reply.
+      await live.message.delete().catch(() => undefined);
+      return false;
+    }
+
+    const rest = body.slice(live.consumed);
+    const chunks = rest.length > DISCORD_MAX_LENGTH ? splitMessage(rest, DISCORD_MAX_LENGTH) : [rest];
+    await live.message.edit(chunks[0] || '…');
+    const channel = live.message.channel as TextChannel | DMChannel;
+    for (const chunk of chunks.slice(1)) {
+      await channel.send(chunk);
+    }
+    logger.info({ jid, length: body.length }, 'Response finalised (streamed)');
+    return true;
+  } catch (err: any) {
+    logger.warn({ jid, err: err.message }, 'live: finalise failed, falling back to a new message');
+    return false;
+  }
+}
+
+/** Drop a streamed message without finalising it (abort, error, empty turn). */
+export async function discardLiveResponse(jid: string): Promise<void> {
+  await awaitLiveOpen(jid);
+  const live = liveMessages.get(jid);
+  if (!live) return;
+  liveMessages.delete(jid);
+  if (live.timer) clearTimeout(live.timer);
+  await live.message.delete().catch(() => undefined);
+}
+
 export async function sendResponse(jid: string, text: string): Promise<boolean> {
   if (!client) return false;
+
+  // A streamed reply is already on screen; settle it in place.
+  if (await finishLiveResponse(jid, text)) return true;
 
   const channelId = jid.replace(/^dc:/, '');
 
@@ -421,6 +609,11 @@ export async function sendFilesResponse(
 ): Promise<boolean> {
   if (!client) return false;
 
+  // The text may already be on screen as a streamed message. Settle it there
+  // and send only the attachments, instead of posting the whole reply twice.
+  const streamed = await finishLiveResponse(jid, text);
+  const bodyText = streamed ? '' : text;
+
   const channelId = jid.replace(/^dc:/, '');
 
   try {
@@ -449,15 +642,18 @@ export async function sendFilesResponse(
       }
     }
 
-    const responseText = [text, ...notices].filter(Boolean).join('\n\n');
+    const responseText = [bodyText, ...notices].filter(Boolean).join('\n\n');
     const attachments = await Promise.all(
       valid.map(
         async ({ path }) => new AttachmentBuilder(await readFile(path), { name: basename(path) }),
       ),
     );
 
-    // Fall back to a plain text reply if nothing attachable survived.
+    // Fall back to a plain text reply if nothing attachable survived. When the
+    // text already went out as a streamed message there is nothing left to say,
+    // so do not post "(empty response)" on top of a correct answer.
     if (attachments.length === 0) {
+      if (streamed && !responseText) return true;
       return sendResponse(jid, responseText || '(empty response)');
     }
 
@@ -548,6 +744,7 @@ function escapeRegExp(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+/** Build a Discord-safe thread title (max 100 chars) from sender + message. */
 export function createAutoThreadRegistration(
   parent: RegisteredChannel,
   threadId: string,
@@ -565,7 +762,6 @@ export function createAutoThreadRegistration(
   };
 }
 
-/** Build a Discord-safe thread title (max 100 chars) from sender + message. */
 function buildThreadName(senderName: string, content: string): string {
   const snippet = content.replace(/\s+/g, ' ').trim();
   const raw = snippet ? `${senderName}: ${snippet}` : senderName;

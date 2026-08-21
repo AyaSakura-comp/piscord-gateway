@@ -23,7 +23,12 @@ import { invokeAgent, UNTIL_DONE_MARKER } from './invoke.js';
 import { invokeAgy, isAgyModelRef } from './agy.js';
 import { abortRpcSession, getRpcSession, closeAllRpcSessions } from './rpc-session.js';
 import { parseOutboxMarkers } from './outbox.js';
-import { sendResponse, sendFilesResponse, setTyping } from '../discord/client.js';
+import {
+  discardLiveResponse,
+  sendResponse,
+  sendFilesResponse,
+  setTyping,
+} from '../discord/client.js';
 import { createEventStreamer } from '../discord/stream-events.js';
 import { computeEffectiveChannelSettings } from './channel-settings.js';
 
@@ -295,13 +300,18 @@ async function processMessage(
           onEvent,
         });
 
+    // Both abort paths return without sending a reply, so the partially
+    // streamed message would otherwise stay in the channel as if it were the
+    // answer.
     if (signal.aborted) {
+      void discardLiveResponse(jid);
       markMessageFailed(rowid);
       logger.info({ jid, rowid }, 'Message abandoned: shutdown interrupted processing');
       return;
     }
 
     if (result.aborted) {
+      void discardLiveResponse(jid);
       markMessageAborted(rowid);
       logger.info({ jid, rowid }, 'Message processing aborted with session preserved');
       return;

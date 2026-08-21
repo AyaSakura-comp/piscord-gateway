@@ -12,7 +12,7 @@
 
 import { config } from '../config.js';
 import { logger } from '../logger.js';
-import { sendResponse } from './client.js';
+import { sendResponse, updateLiveResponse } from './client.js';
 
 /** Discord caps a single message at 2000 chars. We leave headroom for the prefix. */
 function truncate(s: string, cap: number): string {
@@ -37,21 +37,47 @@ function summarizeToolArgs(args: unknown): string {
  * to `invokeAgent` as `onEvent`. It is async-but-fire-and-forget on Discord
  * sends so it never back-pressures pi.
  */
-export function createEventStreamer(jid: string): (event: any) => Promise<void> {
+export function createEventStreamer(
+  jid: string,
+  options: { enabled?: boolean } = {},
+): (event: any) => Promise<void> {
   // Serialize Discord sends per channel so messages arrive in event order
   // even when pi emits faster than the Discord API can accept.
   let pending: Promise<void> = Promise.resolve();
   const enqueueSend = (text: string) => {
     pending = pending
       .then(() => sendResponse(jid, text).then(() => undefined))
-      .catch((err) =>
-        logger.warn({ err: err?.message, jid }, 'stream-events: send failed'),
-      );
+      .catch((err) => logger.warn({ err: err?.message, jid }, 'stream-events: send failed'));
     return pending;
   };
 
+  // The reply as it is being written. Buffered here and pushed into the live
+  // Discord message, which sendResponse later finalises in place.
+  let liveText = '';
+
   return async (event: any) => {
-    if (!event || typeof event !== 'object') return;
+    if (options.enabled === false || !event || typeof event !== 'object') return;
+
+    // ── Streaming reply ─────────────────────────────────────────────────
+    // Discord has no server-push, so the reply is streamed by editing one
+    // message as it grows; updateLiveResponse throttles those edits.
+    if (
+      config.streamPartialText &&
+      event.type === 'message_update' &&
+      event.assistantMessageEvent?.type === 'text_delta'
+    ) {
+      liveText += String(event.assistantMessageEvent.delta ?? '');
+      void updateLiveResponse(jid, liveText);
+      return;
+    }
+
+    // No turn-boundary handling here on purpose. `agent_end` closes one
+    // low-level run and `turn_end` follows it, so any such branch runs several
+    // times per user turn: an earlier version reset `liveText` on the first and
+    // then, seeing it empty on the second, deleted the streamed message — so
+    // sendResponse found nothing to settle and posted the reply as a fresh one.
+    // This closure is built per message (queue.ts), so `liveText` is already
+    // per-turn, and an empty turn is cleaned up by finishLiveResponse.
 
     // ── Thinking blocks ─────────────────────────────────────────────────
     // Each turn's thinking arrives as `*_start` / `*_delta` / `*_end`. We
@@ -96,19 +122,14 @@ export function createEventStreamer(jid: string): (event: any) => Promise<void> 
     // ── Tool results — arrive as their own message (role=tool) after the
     // assistant's toolcall completes. Each content block is a ToolResult
     // referencing the originating tool by id; we forward the textual output.
-    if (
-      config.streamTools &&
-      event.type === 'message_end' &&
-      event.message?.role === 'tool'
-    ) {
+    if (config.streamTools && event.type === 'message_end' && event.message?.role === 'tool') {
       const parts = event.message.content ?? [];
       const text = parts
         .map((c: any) => {
           // ToolResult content can be a string, an array of TextContent, or
           // an object with `.text` — be defensive.
           if (typeof c?.content === 'string') return c.content;
-          if (Array.isArray(c?.content))
-            return c.content.map((p: any) => p?.text ?? '').join('\n');
+          if (Array.isArray(c?.content)) return c.content.map((p: any) => p?.text ?? '').join('\n');
           return c?.text ?? '';
         })
         .join('\n')
@@ -124,7 +145,10 @@ export function createEventStreamer(jid: string): (event: any) => Promise<void> 
     // is delivered by the caller's normal final-response path; the rest is
     // bookkeeping. Log at debug for future expansion.
     if (event.type) {
-      logger.debug({ jid, type: event.type, sub: event.assistantMessageEvent?.type }, 'stream-events: unhandled');
+      logger.debug(
+        { jid, type: event.type, sub: event.assistantMessageEvent?.type },
+        'stream-events: unhandled',
+      );
     }
   };
 }

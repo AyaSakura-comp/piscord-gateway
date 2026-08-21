@@ -167,6 +167,13 @@ export const config = {
   /** How long a single agy tool call may run before the transcript says so. */
   agyToolStallWarnMs: envInt('AGY_TOOL_STALL_WARN_MS', 120_000, { min: 5_000 }),
 
+  /**
+   * Stream the assistant's reply into Discord by editing one message as it is
+   * written, instead of posting it whole when the turn ends. Edits are
+   * throttled to stay inside Discord's per-channel rate limit.
+   */
+  streamPartialText: envBool('STREAM_PARTIAL_TEXT', true),
+
   /** Default model for pi */
   piModel: env('PI_MODEL'),
 
