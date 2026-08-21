@@ -12,7 +12,7 @@
 
 import { config } from '../config.js';
 import { logger } from '../logger.js';
-import { sendResponse, updateLiveResponse } from './client.js';
+import { sealLiveResponse, sendResponse, updateLiveResponse } from './client.js';
 
 /** Discord caps a single message at 2000 chars. We leave headroom for the prefix. */
 function truncate(s: string, cap: number): string {
@@ -46,10 +46,31 @@ export function createEventStreamer(
   let pending: Promise<void> = Promise.resolve();
   const enqueueSend = (text: string) => {
     pending = pending
+      // Seal first: a message's position is fixed when it is created, so the
+      // reply written so far must stop growing before this one goes below it,
+      // or the finished answer ends up above the thinking that produced it.
+      .then(() => sealLiveResponse(jid))
       // settleLive: false — these are thinking/tool messages, not the answer,
       // and must never take over the streamed reply's message.
       .then(() => sendResponse(jid, text, { settleLive: false }).then(() => undefined))
       .catch((err) => logger.warn({ err: err?.message, jid }, 'stream-events: send failed'));
+    return pending;
+  };
+
+  /**
+   * The streamed reply goes through the SAME queue as thinking and tool
+   * messages. It opens a real Discord message, so leaving it unserialized let
+   * it jump ahead of a thinking block whose send was still in flight — the
+   * answer appeared above the thinking that produced it.
+   *
+   * Throttled edits return immediately after arming a timer, so this does not
+   * hold up the queue; only the first send, which is the one that fixes the
+   * message's position in the channel, is actually waited on.
+   */
+  const enqueueLive = () => {
+    pending = pending
+      .then(() => updateLiveResponse(jid, liveText))
+      .catch((err) => logger.warn({ err: err?.message, jid }, 'stream-events: live update failed'));
     return pending;
   };
 
@@ -69,7 +90,7 @@ export function createEventStreamer(
       event.assistantMessageEvent?.type === 'text_delta'
     ) {
       liveText += String(event.assistantMessageEvent.delta ?? '');
-      void updateLiveResponse(jid, liveText);
+      void enqueueLive();
       return;
     }
 

@@ -392,16 +392,28 @@ const DISCORD_MAX_LENGTH = 2000;
 const LIVE_EDIT_MS = 1500;
 
 interface LiveMessage {
-  message: Message;
+  /** The message being written into. Undefined once sealed (see below). */
+  message?: Message;
+  channel: TextChannel | DMChannel;
   /** Text already committed to `message`. */
   shown: string;
-  /** Characters of the reply that earlier, already-full messages consumed. */
+  /** The whole reply as of the last update, so a seal can flush it. */
+  latest: string;
+  /** Characters of the reply that earlier, finished messages consumed. */
   consumed: number;
   lastEditAt: number;
   timer?: NodeJS.Timeout;
 }
 
 const liveMessages = new Map<string, LiveMessage>();
+
+/**
+ * Opening a message is async, but callers fire-and-forget one update per delta
+ * and finishLiveResponse reads the map synchronously. Without a handle on the
+ * in-flight open, rapid deltas each saw an empty map and a short reply
+ * finalised before any send landed, so the reply was posted twice.
+ */
+const liveOpening = new Map<string, Promise<void>>();
 
 /**
  * How many characters of the source a committed message accounts for.
@@ -422,15 +434,14 @@ function liveSlice(live: LiveMessage, full: string): string {
 
 async function pushLive(jid: string, full: string): Promise<void> {
   const live = liveMessages.get(jid);
-  if (!live) return;
+  if (!live?.message) return;
 
-  const channel = live.message.channel as TextChannel | DMChannel;
   let slice = liveSlice(live, full);
 
   // The current message is full: commit it at a line boundary and continue in a
   // new one, so a long reply streams across several messages like a normal
-  // split reply rather than stopping at 2000 characters. Only ever the message
-  // this function opened is edited — never anything else in the channel.
+  // split reply rather than stopping at 2000 characters. Only ever a message
+  // this module opened is edited — never anything else in the channel.
   //
   // A loop, not an `if`: edits are throttled, so between two pushes the reply
   // can grow by more than one message's worth and a single continuation would
@@ -442,14 +453,10 @@ async function pushLive(jid: string, full: string): Promise<void> {
     } catch (err: any) {
       logger.warn({ jid, err: err.message }, 'live: final edit of full message failed');
     }
-    // splitMessage swallows the newline it splits on, so `consumed` has to step
-    // over it too. Counting only head.length left that newline at the head of
-    // the next slice: every continuation opened with a blank line, and the
-    // drift accumulated across each one.
     live.consumed += liveConsumedBy(slice, head);
     slice = liveSlice(live, full);
     const next = splitMessage(slice, DISCORD_MAX_LENGTH)[0] || '…';
-    live.message = await channel.send(next);
+    live.message = await live.channel.send(next);
     live.shown = next;
     live.lastEditAt = Date.now();
   }
@@ -460,28 +467,28 @@ async function pushLive(jid: string, full: string): Promise<void> {
   live.lastEditAt = Date.now();
 }
 
-/**
- * Opening the first message is async, but callers fire-and-forget one call per
- * delta and `finishLiveResponse` reads the map synchronously. Without a handle
- * on the in-flight open, four rapid deltas each see an empty map (four
- * messages), and a short reply finalises before any of them land, so the
- * streamed message is orphaned and the reply gets posted twice. Everything that
- * touches `liveMessages` awaits this first.
- */
-const liveOpening = new Map<string, Promise<void>>();
-
+/** Open the message the reply is written into, resuming after a seal. */
 async function openLive(jid: string, full: string): Promise<void> {
+  const existing = liveMessages.get(jid);
   const channelId = jid.replace(/^dc:/, '');
   try {
-    const channel = await client!.channels.fetch(channelId);
-    if (!channel || !('send' in channel)) return;
-    const message = await (channel as TextChannel | DMChannel).send(
-      full.slice(0, DISCORD_MAX_LENGTH),
-    );
+    let channel = existing?.channel;
+    if (!channel) {
+      const fetched = await client!.channels.fetch(channelId);
+      if (!fetched || !('send' in fetched)) return;
+      channel = fetched as TextChannel | DMChannel;
+    }
+    const consumed = existing?.consumed ?? 0;
+    const body = full.slice(consumed, consumed + DISCORD_MAX_LENGTH);
+    if (!body.trim()) return;
+    const message = await channel.send(body);
+    logger.info({ jid, resumed: Boolean(existing) }, 'Streaming reply opened');
     liveMessages.set(jid, {
       message,
-      shown: full.slice(0, DISCORD_MAX_LENGTH),
-      consumed: 0,
+      channel,
+      shown: body,
+      latest: full,
+      consumed,
       lastEditAt: Date.now(),
     });
   } catch (err: any) {
@@ -489,7 +496,7 @@ async function openLive(jid: string, full: string): Promise<void> {
   }
 }
 
-/** Resolve once any in-flight first-message send has settled. */
+/** Resolve once any in-flight message send has settled. */
 async function awaitLiveOpen(jid: string): Promise<void> {
   await liveOpening.get(jid)?.catch(() => undefined);
 }
@@ -498,7 +505,10 @@ async function awaitLiveOpen(jid: string): Promise<void> {
 export async function updateLiveResponse(jid: string, full: string): Promise<void> {
   if (!client || !full.trim()) return;
 
-  if (!liveMessages.has(jid)) {
+  const known = liveMessages.get(jid);
+  if (known) known.latest = full;
+
+  if (!known?.message) {
     let opening = liveOpening.get(jid);
     if (!opening) {
       opening = openLive(jid, full);
@@ -514,7 +524,7 @@ export async function updateLiveResponse(jid: string, full: string): Promise<voi
   }
 
   const live = liveMessages.get(jid);
-  if (!live) return;
+  if (!live?.message) return;
 
   const wait = LIVE_EDIT_MS - (Date.now() - live.lastEditAt);
   if (wait > 0) {
@@ -538,6 +548,39 @@ export async function updateLiveResponse(jid: string, full: string): Promise<voi
 }
 
 /**
+ * Stop writing into the current message, without ending the reply.
+ *
+ * A Discord message's position is fixed when it is created, but a streamed
+ * reply keeps growing. In a multi-step turn the reply therefore opened before
+ * the tool calls and thinking that came later in the SAME turn, and the
+ * finished answer ended up sitting above the thinking that produced it.
+ *
+ * Sealing before each of those messages keeps the channel chronological: what
+ * was written so far stays put, and the next tokens open a fresh message below
+ * the thinking. `consumed` carries across, so nothing is delivered twice.
+ */
+export async function sealLiveResponse(jid: string): Promise<void> {
+  await awaitLiveOpen(jid);
+  const live = liveMessages.get(jid);
+  if (!live?.message) return;
+
+  if (live.timer) {
+    clearTimeout(live.timer);
+    live.timer = undefined;
+  }
+  // Flush whatever the throttle was still holding back, or it would be lost.
+  await pushLive(jid, live.latest).catch((err) =>
+    logger.warn({ jid, err: err?.message }, 'live: flush before seal failed'),
+  );
+
+  const sealed = liveMessages.get(jid);
+  if (!sealed?.message) return;
+  sealed.consumed += sealed.shown.length;
+  sealed.shown = '';
+  sealed.message = undefined;
+}
+
+/**
  * Settle the streamed message on the final text.
  *
  * Returns true when it delivered the reply, so the caller must not send it
@@ -555,16 +598,20 @@ export async function finishLiveResponse(jid: string, finalText: string): Promis
     if (!body) {
       // The turn produced nothing deliverable; drop the preview rather than
       // leaving a half-written sentence as the reply.
-      await live.message.delete().catch(() => undefined);
+      await live.message?.delete().catch(() => undefined);
       return false;
     }
 
     const rest = body.slice(live.consumed);
     const chunks = rest.length > DISCORD_MAX_LENGTH ? splitMessage(rest, DISCORD_MAX_LENGTH) : [rest];
-    await live.message.edit(chunks[0] || '…');
-    const channel = live.message.channel as TextChannel | DMChannel;
+    if (live.message) {
+      await live.message.edit(chunks[0] || '…');
+    } else if (chunks[0]) {
+      // Sealed: the tail after the last thinking block still needs a message.
+      await live.channel.send(chunks[0]);
+    }
     for (const chunk of chunks.slice(1)) {
-      await channel.send(chunk);
+      await live.channel.send(chunk);
     }
     logger.info({ jid, length: body.length }, 'Response finalised (streamed)');
     return true;
@@ -581,7 +628,7 @@ export async function discardLiveResponse(jid: string): Promise<void> {
   if (!live) return;
   liveMessages.delete(jid);
   if (live.timer) clearTimeout(live.timer);
-  await live.message.delete().catch(() => undefined);
+  await live.message?.delete().catch(() => undefined);
 }
 
 export async function sendResponse(

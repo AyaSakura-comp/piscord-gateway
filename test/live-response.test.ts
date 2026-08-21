@@ -49,14 +49,14 @@ describe('streamed Discord replies', () => {
   it('continues into a new message when one fills up', () => {
     expect(CLIENT).toContain('live.consumed += liveConsumedBy(slice, head)');
     // The continuation is a message this code opened, not one already there.
-    expect(CLIENT).toContain('live.message = await channel.send(next)');
+    expect(CLIENT).toContain('live.message = await live.channel.send(next)');
   });
 
   it('drops the preview when a turn ends with nothing to say', () => {
     // An empty final text deletes the preview rather than leaving a
     // half-written sentence standing as the answer.
     const fin = CLIENT.slice(CLIENT.indexOf('export async function finishLiveResponse('));
-    expect(fin).toMatch(/if \(!body\) \{[\s\S]*?live\.message\.delete\(\)/);
+    expect(fin).toMatch(/if \(!body\) \{[\s\S]*?live\.message\?\.delete\(\)/);
   });
 
   /**
@@ -68,7 +68,7 @@ describe('streamed Discord replies', () => {
    */
   it('does not discard on turn boundaries, which fire more than once', () => {
     expect(EVENTS).not.toContain('discardLiveResponse');
-    const deltas = EVENTS.indexOf('updateLiveResponse(jid, liveText)');
+    const deltas = EVENTS.indexOf('void enqueueLive()');
     expect(EVENTS.slice(deltas)).not.toMatch(/liveText = '';/);
   });
 
@@ -110,7 +110,21 @@ describe('streamed Discord replies', () => {
   it('feeds text deltas, not thinking deltas, into the reply', () => {
     const block = EVENTS.slice(EVENTS.indexOf('// ── Streaming reply'), EVENTS.indexOf('// ── Thinking blocks'));
     expect(block).toContain("=== 'text_delta'");
-    expect(block).toContain('updateLiveResponse(jid, liveText)');
+    expect(block).toContain('enqueueLive()');
+  });
+
+  /**
+   * Regression: the `pending` chain exists so messages arrive in event order.
+   * The streamed reply opens a real message, and sending it outside that chain
+   * let it jump ahead of a thinking block whose send was still in flight — the
+   * answer showed up above the thinking that produced it.
+   */
+  it('sends the reply through the same ordering queue as thinking and tools', () => {
+    expect(EVENTS).toMatch(/const enqueueLive = \(\) => \{\s*pending = pending/);
+    // No unserialized send may remain.
+    expect(EVENTS).not.toContain('void updateLiveResponse(');
+    const handler = EVENTS.slice(EVENTS.indexOf("=== 'text_delta'"));
+    expect(handler.slice(0, 300)).toContain('enqueueLive()');
   });
 });
 
@@ -166,5 +180,138 @@ describe('streamed replies at the Discord character cap', () => {
     // pushes; an `if` instead of a `while` would strand the overflow.
     const push = CLIENT.slice(CLIENT.indexOf('async function pushLive('));
     expect(push).toMatch(/while \(slice\.length > DISCORD_MAX_LENGTH\)/);
+  });
+});
+
+/**
+ * A Discord message's position is fixed when it is created, but a streamed
+ * reply keeps growing. In a multi-step turn (text, tool, thinking, more text)
+ * the reply therefore opened above the thinking that came later in the same
+ * turn, and the finished answer sat above the thinking that produced it.
+ */
+describe('ordering against thinking and tool messages', () => {
+  it('seals the reply before each thinking or tool message', () => {
+    const enqueue = EVENTS.slice(EVENTS.indexOf('const enqueueSend ='), EVENTS.indexOf('const enqueueLive ='));
+    // Sealing must happen before the send, and on the same ordered chain.
+    expect(enqueue.indexOf('sealLiveResponse(jid)')).toBeGreaterThan(enqueue.indexOf('pending = pending'));
+    expect(enqueue.indexOf('sealLiveResponse(jid)')).toBeLessThan(enqueue.indexOf('sendResponse(jid, text'));
+  });
+
+  it('carries `consumed` across a seal so nothing is delivered twice', () => {
+    const seal = CLIENT.slice(CLIENT.indexOf('export async function sealLiveResponse('));
+    expect(seal.slice(0, 900)).toContain('sealed.consumed += sealed.shown.length');
+    // The entry survives; only the message handle is dropped.
+    expect(seal.slice(0, 900)).toContain('sealed.message = undefined');
+    expect(seal.slice(0, 900)).not.toContain('liveMessages.delete');
+  });
+
+  it('flushes throttled text before sealing, or it would be lost', () => {
+    const seal = CLIENT.slice(CLIENT.indexOf('export async function sealLiveResponse('));
+    expect(seal.indexOf('pushLive(jid, live.latest)')).toBeLessThan(
+      seal.indexOf('sealed.consumed +='),
+    );
+  });
+
+  it('resumes into a new message below, not by editing the sealed one', () => {
+    const open = CLIENT.slice(CLIENT.indexOf('async function openLive('));
+    expect(open.slice(0, 900)).toContain('const consumed = existing?.consumed ?? 0');
+    expect(open.slice(0, 900)).toContain('full.slice(consumed, consumed + DISCORD_MAX_LENGTH)');
+  });
+
+  it('sends the tail after the last seal instead of losing it', () => {
+    const fin = CLIENT.slice(CLIENT.indexOf('export async function finishLiveResponse('));
+    // Sealed => no message handle => the remainder needs a fresh message.
+    expect(fin).toMatch(/} else if \(chunks\[0\]\) \{\s*\/\/[\s\S]*?await live\.channel\.send\(chunks\[0\]\);/);
+  });
+});
+
+/**
+ * Sealing splits one reply across several messages, so `consumed` is now the
+ * only thing keeping the pieces from overlapping or leaving a hole. This
+ * replays the real bookkeeping — grow, seal, resume, finalise — and reassembles
+ * what the channel would hold.
+ */
+describe('reply integrity across seals', () => {
+  const MAX = 2000;
+
+  /**
+   * Replays the real functions, including their refusals: pushLive writes
+   * nothing while sealed, and openLive caps its first body at MAX.
+   */
+  function deliver(full: string, sealAfter: number[]): string[] {
+    const messages: string[] = [];
+    let consumed = 0;
+    let shown: string | null = null; // null = sealed, or not yet open
+
+    const openLive = (upTo: number) => {
+      if (shown !== null) return;
+      const body = full.slice(consumed, Math.min(upTo, consumed + MAX));
+      if (!body.trim()) return;
+      shown = body;
+      messages.push(body);
+    };
+
+    const pushLive = (upTo: number) => {
+      if (shown === null) return; // sealed: refuses to write
+      let slice = full.slice(consumed, upTo);
+      while (slice.length > MAX) {
+        const head = splitMessage(slice, MAX)[0];
+        messages[messages.length - 1] = head;
+        consumed += liveConsumedBy(slice, head);
+        slice = full.slice(consumed, upTo);
+        shown = splitMessage(slice, MAX)[0] || '…';
+        messages.push(shown);
+      }
+      if (slice === shown || !slice) return;
+      shown = slice;
+      messages[messages.length - 1] = shown;
+    };
+
+    for (const at of sealAfter) {
+      openLive(at);
+      pushLive(at);
+      if (shown !== null) {
+        consumed += (shown as string).length; // sealLiveResponse
+        shown = null;
+      }
+    }
+    openLive(full.length);
+    pushLive(full.length);
+
+    const rest = full.slice(consumed); // finishLiveResponse
+    const chunks = rest.length > MAX ? splitMessage(rest, MAX) : [rest];
+    if (shown !== null) messages[messages.length - 1] = chunks[0] || '…';
+    else if (chunks[0]) messages.push(chunks[0]);
+    messages.push(...chunks.slice(1));
+    return messages.filter((m) => m !== '');
+  }
+
+  const REPLY = Array.from({ length: 300 }, (_, i) => `第 ${i} 行 ${'字'.repeat(15)}`).join('\n');
+
+  it('delivers every character exactly once across seals', () => {
+    // Compared without newlines: an overflow split drops the newline it split
+    // on, while a seal drops nothing, so the two boundaries rejoin differently.
+    // What must hold either way is that every character arrives exactly once.
+    const delivered = deliver(REPLY, [500, 1200, 4000, 9000]).join('');
+    expect(delivered.replace(/\n/g, '')).toBe(REPLY.replace(/\n/g, ''));
+  });
+
+  it('holds with no seals, and with a seal at every boundary', () => {
+    const bare = REPLY.replace(/\n/g, '');
+    expect(deliver(REPLY, []).join('').replace(/\n/g, '')).toBe(bare);
+    const every = Array.from({ length: 20 }, (_, i) => (i + 1) * 400);
+    expect(deliver(REPLY, every).join('').replace(/\n/g, '')).toBe(bare);
+  });
+
+  it('never emits a message over the Discord cap', () => {
+    for (const m of deliver(REPLY, [500, 4000, 9000])) {
+      expect(m.length).toBeLessThanOrEqual(MAX);
+    }
+  });
+
+  it('does not re-send text that a sealed message already holds', () => {
+    const messages = deliver(REPLY, [3000]);
+    const first = messages[0];
+    expect(messages.slice(1).some((m) => m.includes(first.slice(0, 200)))).toBe(false);
   });
 });
