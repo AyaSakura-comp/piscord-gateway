@@ -46,7 +46,9 @@ export function createEventStreamer(
   let pending: Promise<void> = Promise.resolve();
   const enqueueSend = (text: string) => {
     pending = pending
-      .then(() => sendResponse(jid, text).then(() => undefined))
+      // settleLive: false — these are thinking/tool messages, not the answer,
+      // and must never take over the streamed reply's message.
+      .then(() => sendResponse(jid, text, { settleLive: false }).then(() => undefined))
       .catch((err) => logger.warn({ err: err?.message, jid }, 'stream-events: send failed'));
     return pending;
   };

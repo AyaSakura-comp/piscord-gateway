@@ -403,6 +403,18 @@ interface LiveMessage {
 
 const liveMessages = new Map<string, LiveMessage>();
 
+/**
+ * How many characters of the source a committed message accounts for.
+ *
+ * splitMessage swallows the newline it splits on, so the head is one character
+ * shorter than what it consumed. Counting only `head.length` left that newline
+ * at the front of the next slice: every continuation message opened with a
+ * blank line, and the offset drifted further with each one.
+ */
+export function liveConsumedBy(slice: string, head: string): number {
+  return head.length + (slice[head.length] === '\n' ? 1 : 0);
+}
+
 /** Text that belongs in the current message, given what earlier ones took. */
 function liveSlice(live: LiveMessage, full: string): string {
   return full.slice(live.consumed);
@@ -412,25 +424,34 @@ async function pushLive(jid: string, full: string): Promise<void> {
   const live = liveMessages.get(jid);
   if (!live) return;
 
+  const channel = live.message.channel as TextChannel | DMChannel;
   let slice = liveSlice(live, full);
 
-  // The current message is full: commit it at a line boundary and continue in
-  // a new one, so a long reply streams across several messages like a normal
-  // split reply rather than stopping at 2000 characters.
-  if (slice.length > DISCORD_MAX_LENGTH) {
+  // The current message is full: commit it at a line boundary and continue in a
+  // new one, so a long reply streams across several messages like a normal
+  // split reply rather than stopping at 2000 characters. Only ever the message
+  // this function opened is edited — never anything else in the channel.
+  //
+  // A loop, not an `if`: edits are throttled, so between two pushes the reply
+  // can grow by more than one message's worth and a single continuation would
+  // leave the overflow unsent until the next tick.
+  while (slice.length > DISCORD_MAX_LENGTH) {
     const head = splitMessage(slice, DISCORD_MAX_LENGTH)[0];
     try {
       await live.message.edit(head);
     } catch (err: any) {
       logger.warn({ jid, err: err.message }, 'live: final edit of full message failed');
     }
-    live.consumed += head.length;
+    // splitMessage swallows the newline it splits on, so `consumed` has to step
+    // over it too. Counting only head.length left that newline at the head of
+    // the next slice: every continuation opened with a blank line, and the
+    // drift accumulated across each one.
+    live.consumed += liveConsumedBy(slice, head);
     slice = liveSlice(live, full);
-    const channel = live.message.channel as TextChannel | DMChannel;
-    live.message = await channel.send(slice.slice(0, DISCORD_MAX_LENGTH) || '…');
-    live.shown = slice.slice(0, DISCORD_MAX_LENGTH);
+    const next = splitMessage(slice, DISCORD_MAX_LENGTH)[0] || '…';
+    live.message = await channel.send(next);
+    live.shown = next;
     live.lastEditAt = Date.now();
-    return;
   }
 
   if (slice === live.shown || !slice) return;
@@ -563,11 +584,20 @@ export async function discardLiveResponse(jid: string): Promise<void> {
   await live.message.delete().catch(() => undefined);
 }
 
-export async function sendResponse(jid: string, text: string): Promise<boolean> {
+export async function sendResponse(
+  jid: string,
+  text: string,
+  options: { settleLive?: boolean } = {},
+): Promise<boolean> {
   if (!client) return false;
 
   // A streamed reply is already on screen; settle it in place.
-  if (await finishLiveResponse(jid, text)) return true;
+  //
+  // Only the caller delivering the turn's ANSWER may do this. The event
+  // streamer also posts through here (thinking blocks, tool status), and
+  // settling on those rewrote the half-written reply with a thinking block —
+  // the reply appeared to mutate into some other message mid-stream.
+  if (options.settleLive !== false && (await finishLiveResponse(jid, text))) return true;
 
   const channelId = jid.replace(/^dc:/, '');
 
@@ -725,7 +755,7 @@ export function getBotTag(): string | undefined {
 
 // ── Helpers ──
 
-function splitMessage(text: string, max: number): string[] {
+export function splitMessage(text: string, max: number): string[] {
   const chunks: string[] = [];
   let remaining = text;
 
