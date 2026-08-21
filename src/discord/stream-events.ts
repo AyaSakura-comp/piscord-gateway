@@ -15,6 +15,7 @@ import { logger } from '../logger.js';
 import {
   beginLiveResponse,
   finishThinkingMessage,
+  updateThinkingMessage,
   openThinkingMessage,
   sealLiveResponse,
   sendResponse,
@@ -84,6 +85,15 @@ export function createEventStreamer(
   // A new turn: re-open streaming for this channel (see beginLiveResponse).
   beginLiveResponse(jid);
 
+  // The reasoning as it is being written, and how it renders in Discord:
+  // a quote block, so it shows as an indented grey aside.
+  let thinkingText = '';
+  const renderThinking = (text: string) =>
+    `💭 *Thinking:*\n${truncate(text, config.maxEventChars - 50)
+      .split('\n')
+      .map((l) => `> ${l}`)
+      .join('\n')}`;
+
   // The reply as it is being written. Buffered here and pushed into the live
   // Discord message, which sendResponse later finalises in place.
   let liveText = '';
@@ -123,12 +133,33 @@ export function createEventStreamer(
       event.type === 'message_update' &&
       event.assistantMessageEvent?.type === 'thinking_start'
     ) {
+      thinkingText = '';
       pending = pending
         .then(() => sealLiveResponse(jid))
         .then(() => openThinkingMessage(jid))
         .catch((err) => logger.warn({ err: err?.message, jid }, 'stream-events: reserve failed'));
       return;
     }
+    // Fill the reserved message as the reasoning is written, so it is not
+    // still saying "Thinking…" while the answer streams below it.
+    if (
+      config.streamThinking &&
+      event.type === 'message_update' &&
+      event.assistantMessageEvent?.type === 'thinking_delta'
+    ) {
+      const ev = event.assistantMessageEvent;
+      // `delta` is incremental; some providers send a cumulative `content`
+      // instead, which must replace rather than append.
+      if (typeof ev.delta === 'string') thinkingText += ev.delta;
+      else if (typeof ev.content === 'string') thinkingText = ev.content;
+      else return;
+      const rendered = renderThinking(thinkingText);
+      pending = pending
+        .then(() => updateThinkingMessage(jid, rendered))
+        .catch((err) => logger.warn({ err: err?.message, jid }, 'stream-events: thinking update failed'));
+      return;
+    }
+
     // ── Thinking blocks ─────────────────────────────────────────────────
     // Each turn's thinking arrives as `*_start` / `*_delta` / `*_end`. We
     // fire only on `_end` (one Discord message per thinking block, not per
@@ -140,14 +171,7 @@ export function createEventStreamer(
     ) {
       const text = String(event.assistantMessageEvent.content ?? '').trim();
       if (text) {
-        const body = truncate(text, config.maxEventChars - 50);
-        // Discord quote-block formatting: each line gets `> ` so it renders
-        // as an indented gray block.
-        const quoted = body
-          .split('\n')
-          .map((l) => `> ${l}`)
-          .join('\n');
-        const rendered = `💭 *Thinking:*\n${quoted}`;
+        const rendered = renderThinking(text);
         // Fill the message reserved at thinking_start; only fall back to
         // sending a new one if there was none (reservation failed, or the
         // provider emits no thinking_start).

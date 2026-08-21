@@ -219,9 +219,9 @@ describe('ordering against thinking and tool messages', () => {
   });
 
   it('sends the tail after the last seal instead of losing it', () => {
-    const fin = CLIENT.slice(CLIENT.indexOf('export async function finishLiveResponse('));
+    const deliver = CLIENT.slice(CLIENT.indexOf('async function deliverRemainder('));
     // Sealed => no message handle => the remainder needs a fresh message.
-    expect(fin).toMatch(/} else if \(chunks\[0\]\) \{\s*\/\/[\s\S]*?await live\.channel\.send\(chunks\[0\]\);/);
+    expect(deliver).toMatch(/} else if \(chunks\[0\]\) \{[\s\S]*?await live\.channel\.send\(chunks\[0\]\);/);
   });
 });
 
@@ -376,9 +376,9 @@ describe('final text that differs from what was streamed', () => {
   it('checks the offset is meaningful before slicing by it', () => {
     const fin = CLIENT.slice(CLIENT.indexOf('export async function finishLiveResponse('));
     expect(fin).toContain('body.slice(0, live.consumed) !== streamed.slice(0, live.consumed)');
-    // The check must precede the slice it guards.
+    // The check must precede the delivery it guards.
     expect(fin.indexOf('streamed.slice(0, live.consumed)')).toBeLessThan(
-      fin.indexOf('const rest = body.slice(live.consumed)'),
+      fin.indexOf('deliverRemainder(live, body)'),
     );
   });
 
@@ -408,7 +408,7 @@ describe('multi-run turns where the final text is the tail of the stream', () =>
   it('settles in place instead of re-sending the answer', () => {
     const fin = CLIENT.slice(CLIENT.indexOf('export async function finishLiveResponse('));
     const tail = fin.slice(fin.indexOf('streamed.trim().endsWith(body)'));
-    expect(tail.slice(0, 400)).toContain('pushLive(jid, streamed)');
+    expect(tail.slice(0, 400)).toContain('deliverRemainder(live, streamed)');
     expect(tail.slice(0, 400)).toContain('return true;');
     // It must not delete anything in this branch — the answer is on screen.
     expect(tail.slice(0, 400)).not.toContain('message.delete()');
@@ -421,13 +421,23 @@ describe('multi-run turns where the final text is the tail of the stream', () =>
     );
   });
 
-  it('keeps the entry alive until the flush has run', () => {
+  /**
+   * A turn calls sendResponse once per run. While the entry was deleted in a
+   * `finally`, the second call still saw the first reply's entry and inherited
+   * a `consumed` past the end of its own text — the remainder computed empty
+   * and the answer was silently dropped. Measured: consumed 3964, text 3555.
+   */
+  it('claims the entry synchronously, before any await', () => {
     const fin = CLIENT.slice(CLIENT.indexOf('export async function finishLiveResponse('));
-    // Deleting on entry would make the flush a no-op: pushLive reads the map.
-    expect(fin.indexOf('pushLive(jid, streamed)')).toBeLessThan(
-      fin.indexOf('liveMessages.delete(jid)'),
-    );
-    expect(fin).toMatch(/} finally \{[\s\S]*?liveMessages\.delete\(jid\);/);
+    const head = fin.slice(0, fin.indexOf('const body ='));
+    expect(head).toContain('liveMessages.delete(jid);');
+    // Delivery works off `live`, so nothing needs the map afterwards.
+    expect(fin).not.toMatch(/} finally \{[\s\S]*?liveMessages\.delete\(jid\);/);
+  });
+
+  it('rejects an offset that runs past the text it indexes', () => {
+    const fin = CLIENT.slice(CLIENT.indexOf('export async function finishLiveResponse('));
+    expect(fin).toContain('live.consumed > body.length ||');
   });
 
   it('blocks updates that arrive after the reply was settled', () => {
@@ -437,5 +447,104 @@ describe('multi-run turns where the final text is the tail of the stream', () =>
     // And a new turn must clear it, or streaming stops after the first reply.
     expect(CLIENT).toContain('export function beginLiveResponse(');
     expect(EVENTS).toContain('beginLiveResponse(jid)');
+  });
+});
+
+/**
+ * pushLive refuses to write while the reply is sealed. Using it to flush the
+ * final text meant a reply sealed by a trailing tool message lost everything
+ * after the seal — the answer stopped mid-sentence and the message showed the
+ * "…" placeholder.
+ */
+describe('the tail of a sealed reply', () => {
+  it('delivers through a path that works while sealed', () => {
+    const fin = CLIENT.slice(CLIENT.indexOf('export async function finishLiveResponse('));
+    // pushLive is for live edits only; it early-returns with no message handle.
+    expect(fin).not.toContain('pushLive(');
+    const push = CLIENT.slice(CLIENT.indexOf('async function pushLive('));
+    expect(push.slice(0, 200)).toContain('if (!live?.message) return;');
+  });
+
+  it('never overwrites a message with the "…" placeholder', () => {
+    const deliver = CLIENT.slice(
+      CLIENT.indexOf('async function deliverRemainder('),
+      CLIENT.indexOf('export async function finishLiveResponse('),
+    );
+    expect(deliver).not.toContain("|| '…'");
+    // An empty remainder leaves the message showing what it already has.
+    expect(deliver).toContain('if (!rest) return;');
+  });
+});
+
+/**
+ * The reserved thinking message used to sit on "Thinking…" until thinking_end,
+ * which pi emits only when the assistant message completes — so the reasoning
+ * appeared to update after the answer it produced.
+ */
+describe('thinking that fills in as it is written', () => {
+  it('feeds thinking deltas into the reserved message', () => {
+    const block = EVENTS.slice(EVENTS.indexOf("=== 'thinking_delta'"));
+    expect(block.slice(0, 700)).toContain('updateThinkingMessage(jid, rendered)');
+    expect(block.slice(0, 700)).toContain('pending = pending');
+  });
+
+  it('appends an incremental delta but replaces a cumulative content', () => {
+    const block = EVENTS.slice(EVENTS.indexOf("=== 'thinking_delta'"));
+    expect(block.slice(0, 700)).toContain("if (typeof ev.delta === 'string') thinkingText += ev.delta;");
+    expect(block.slice(0, 700)).toContain("else if (typeof ev.content === 'string') thinkingText = ev.content;");
+  });
+
+  it('throttles those edits like the reply', () => {
+    const upd = CLIENT.slice(CLIENT.indexOf('export async function updateThinkingMessage('));
+    expect(upd.slice(0, 600)).toContain('LIVE_EDIT_MS - (Date.now() - live.lastEditAt)');
+  });
+
+  it('renders the deltas and the final content the same way', () => {
+    // One renderer, or the block would visibly reflow when it settles.
+    expect(EVENTS).toContain('const renderThinking = (text: string) =>');
+    // Both call sites: the streaming deltas and the authoritative end event.
+    expect((EVENTS.match(/renderThinking\(/g) || []).length).toBe(2);
+  });
+
+  it('resets the buffer per block, so two blocks do not concatenate', () => {
+    const start = EVENTS.slice(EVENTS.indexOf("=== 'thinking_start'"));
+    expect(start.slice(0, 300)).toContain("thinkingText = '';");
+  });
+});
+
+/**
+ * Both truncation bugs here were silent: an offset advanced against a
+ * different string leaves a hole, and the reply still looks finished.
+ */
+describe('delivery accounting', () => {
+  it('warns when the offsets do not cover the whole reply', () => {
+    const deliver = CLIENT.slice(
+      CLIENT.indexOf('async function deliverRemainder('),
+      CLIENT.indexOf('export async function finishLiveResponse('),
+    );
+    expect(deliver).toContain('live.consumed + rest.length !== text.length');
+    expect(deliver).toContain('some of it will be missing');
+  });
+});
+
+/**
+ * `consumed` and `latest` are two views of the same stream and they drift:
+ * measured on a three-run turn, consumed reached 5390 — the true total
+ * streamed — while latest held only the last 4492. Trusting the offset
+ * computed an empty remainder and silently swallowed the end of the answer.
+ * Neither path may deliver on an offset that does not index its text.
+ */
+describe('offsets that do not index the text they are used on', () => {
+  it('refuses the tail shortcut when the offset overruns', () => {
+    const fin = CLIENT.slice(CLIENT.indexOf('export async function finishLiveResponse('));
+    expect(fin).toContain('streamed.trim().endsWith(body) && live.consumed <= streamed.length');
+  });
+
+  it('refuses the normal path too, and reposts instead of truncating', () => {
+    const fin = CLIENT.slice(CLIENT.indexOf('export async function finishLiveResponse('));
+    expect(fin).toContain('live.consumed > body.length ||');
+    // Withdraw, then false so the caller sends the whole reply.
+    const guard = fin.slice(fin.indexOf('withdrawing the preview'));
+    expect(guard.slice(0, 300)).toContain('return false;');
   });
 });

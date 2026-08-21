@@ -604,10 +604,51 @@ export async function sealLiveResponse(jid: string): Promise<void> {
  * Returns true when it delivered the reply, so the caller must not send it
  * again. Any text beyond what the streamed messages hold is sent as follow-ups.
  */
+/**
+ * Send whatever of `text` has not been committed to a message yet.
+ *
+ * Used by both finish paths. It must not go through pushLive: that refuses to
+ * write while the reply is sealed, so a reply sealed by a trailing tool message
+ * silently lost everything after the seal — the answer just stopped mid-word.
+ */
+async function deliverRemainder(live: LiveMessage, text: string): Promise<void> {
+  const rest = text.slice(live.consumed);
+  // Invariant: what earlier messages took, plus what is left, is the whole
+  // reply. Both truncation bugs in this file showed up here first — an offset
+  // advanced against a different string leaves a hole no test would notice,
+  // because the reply still *looks* finished.
+  if (live.consumed + rest.length !== text.length) {
+    logger.warn(
+      { consumed: live.consumed, rest: rest.length, total: text.length },
+      'live: reply accounting does not cover the text; some of it will be missing',
+    );
+  }
+  if (!rest) return;
+  const chunks = rest.length > DISCORD_MAX_LENGTH ? splitMessage(rest, DISCORD_MAX_LENGTH) : [rest];
+  // Never fall back to a placeholder here: editing a message to "…" would
+  // replace the text it is already showing.
+  if (live.message) {
+    if (chunks[0]) await live.message.edit(chunks[0]);
+  } else if (chunks[0]) {
+    // Sealed: the tail after the last thinking or tool message needs its own.
+    await live.channel.send(chunks[0]);
+  }
+  for (const chunk of chunks.slice(1)) {
+    await live.channel.send(chunk);
+  }
+}
+
 export async function finishLiveResponse(jid: string, finalText: string): Promise<boolean> {
   await awaitLiveOpen(jid);
   const live = liveMessages.get(jid);
   if (!live) return false;
+  // Claim it synchronously. A turn can call sendResponse more than once (one
+  // per run), and while the delete waited in a `finally` the second call saw
+  // the first reply's entry: it inherited a `consumed` past the end of its own
+  // text, so the remainder computed empty and the answer was silently dropped.
+  // Safe to delete now — delivery below works off `live`, not the map.
+  liveMessages.delete(jid);
+  liveClosed.add(jid);
   if (live.timer) clearTimeout(live.timer);
 
   const body = finalText?.trim() ?? '';
@@ -625,16 +666,23 @@ export async function finishLiveResponse(jid: string, finalText: string): Promis
     // those are not the same string, and slicing one by the other's offset
     // re-sent a whole block of the answer beneath the copy already there.
     const streamed = live.latest;
-    if (body.slice(0, live.consumed) !== streamed.slice(0, live.consumed)) {
+    if (
+      live.consumed > body.length ||
+      body.slice(0, live.consumed) !== streamed.slice(0, live.consumed)
+    ) {
       // The usual reason: the queue hands back only the last run's text while
       // the stream carried every run, so the reply is already complete on
       // screen and the "final" text is its tail. Measured: streamed 505 chars,
       // final 368, finalIsTail true. Flush and settle; re-sending would
       // duplicate the answer.
-      if (streamed.trim().endsWith(body)) {
-        await pushLive(jid, streamed).catch((err) =>
-          logger.warn({ jid, err: err?.message }, 'live: final flush failed'),
-        );
+      // `consumed` and `latest` are two views of the same stream and they can
+      // drift: measured on a three-run turn, consumed reached 5390 — the true
+      // total streamed — while latest held only the last 4492. Trusting the
+      // offset there computed an empty remainder and silently swallowed the
+      // end of the answer. Only take this path when the offset actually
+      // indexes the text; otherwise fall through and repost in full.
+      if (streamed.trim().endsWith(body) && live.consumed <= streamed.length) {
+        await deliverRemainder(live, streamed);
         logger.info({ jid, length: streamed.length }, 'Response finalised (streamed in full)');
         return true;
       }
@@ -646,26 +694,12 @@ export async function finishLiveResponse(jid: string, finalText: string): Promis
       return false; // the caller posts the whole reply normally
     }
 
-    const rest = body.slice(live.consumed);
-    const chunks = rest.length > DISCORD_MAX_LENGTH ? splitMessage(rest, DISCORD_MAX_LENGTH) : [rest];
-    if (live.message) {
-      await live.message.edit(chunks[0] || '…');
-    } else if (chunks[0]) {
-      // Sealed: the tail after the last thinking block still needs a message.
-      await live.channel.send(chunks[0]);
-    }
-    for (const chunk of chunks.slice(1)) {
-      await live.channel.send(chunk);
-    }
+    await deliverRemainder(live, body);
     logger.info({ jid, length: body.length }, 'Response finalised (streamed)');
     return true;
   } catch (err: any) {
     logger.warn({ jid, err: err.message }, 'live: finalise failed, falling back to a new message');
     return false;
-  } finally {
-    // Kept in the map until here so the flush above can still reach it.
-    liveMessages.delete(jid);
-    liveClosed.add(jid);
   }
 }
 
@@ -695,7 +729,14 @@ export async function discardLiveResponse(jid: string): Promise<void> {
  * claims the position while the reply is still unwritten, and the content is
  * edited in later.
  */
-const thinkingMessages = new Map<string, Message>();
+interface ThinkingMessage {
+  message: Message;
+  shown: string;
+  lastEditAt: number;
+  timer?: NodeJS.Timeout;
+}
+
+const thinkingMessages = new Map<string, ThinkingMessage>();
 
 /** Claim the thinking block's position in the channel. */
 export async function openThinkingMessage(jid: string): Promise<void> {
@@ -703,11 +744,52 @@ export async function openThinkingMessage(jid: string): Promise<void> {
   try {
     const channel = await client.channels.fetch(jid.replace(/^dc:/, ''));
     if (!channel || !('send' in channel)) return;
-    const message = await (channel as TextChannel | DMChannel).send('💭 *Thinking…*');
-    thinkingMessages.set(jid, message);
+    const shown = '💭 *Thinking…*';
+    const message = await (channel as TextChannel | DMChannel).send(shown);
+    thinkingMessages.set(jid, { message, shown, lastEditAt: Date.now() });
   } catch (err: any) {
     logger.warn({ jid, err: err.message }, 'live: could not reserve the thinking message');
   }
+}
+
+async function pushThinking(jid: string, rendered: string): Promise<void> {
+  const live = thinkingMessages.get(jid);
+  if (!live || rendered === live.shown) return;
+  await live.message.edit(rendered.slice(0, DISCORD_MAX_LENGTH));
+  live.shown = rendered;
+  live.lastEditAt = Date.now();
+}
+
+/**
+ * Fill the reserved message as the reasoning is written.
+ *
+ * Without this the placeholder sat unchanged until `thinking_end`, which pi
+ * only emits when the whole assistant message completes — so the thinking
+ * appeared to update after the answer it produced had already been written.
+ * The deltas arrive throughout, so the block can fill in as it is thought.
+ */
+export async function updateThinkingMessage(jid: string, rendered: string): Promise<void> {
+  const live = thinkingMessages.get(jid);
+  if (!live || !rendered.trim() || rendered === live.shown) return;
+
+  const wait = LIVE_EDIT_MS - (Date.now() - live.lastEditAt);
+  if (wait > 0) {
+    if (live.timer) clearTimeout(live.timer);
+    live.timer = setTimeout(() => {
+      const current = thinkingMessages.get(jid);
+      if (!current) return;
+      current.timer = undefined;
+      void pushThinking(jid, rendered).catch((err) =>
+        logger.warn({ jid, err: err?.message }, 'live: throttled thinking edit failed'),
+      );
+    }, wait);
+    live.timer.unref?.();
+    return;
+  }
+
+  await pushThinking(jid, rendered).catch((err) =>
+    logger.warn({ jid, err: err?.message }, 'live: thinking edit failed'),
+  );
 }
 
 /**
@@ -715,11 +797,12 @@ export async function openThinkingMessage(jid: string): Promise<void> {
  * the caller can fall back to sending it as a normal message.
  */
 export async function finishThinkingMessage(jid: string, text: string): Promise<boolean> {
-  const message = thinkingMessages.get(jid);
-  if (!message) return false;
+  const live = thinkingMessages.get(jid);
+  if (!live) return false;
   thinkingMessages.delete(jid);
+  if (live.timer) clearTimeout(live.timer);
   try {
-    await message.edit(text.slice(0, DISCORD_MAX_LENGTH));
+    await live.message.edit(text.slice(0, DISCORD_MAX_LENGTH));
     return true;
   } catch (err: any) {
     logger.warn({ jid, err: err.message }, 'live: could not fill the thinking message');
@@ -729,10 +812,11 @@ export async function finishThinkingMessage(jid: string, text: string): Promise<
 
 /** Remove a reserved thinking message whose content never arrived. */
 export async function discardThinkingMessage(jid: string): Promise<void> {
-  const message = thinkingMessages.get(jid);
-  if (!message) return;
+  const live = thinkingMessages.get(jid);
+  if (!live) return;
   thinkingMessages.delete(jid);
-  await message.delete().catch(() => undefined);
+  if (live.timer) clearTimeout(live.timer);
+  await live.message.delete().catch(() => undefined);
 }
 
 export async function sendResponse(
