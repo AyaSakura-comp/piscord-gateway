@@ -52,14 +52,135 @@ That's it. The setup wizard checks prerequisites, asks for your Discord bot toke
 - **Daemon management** — systemd on Linux, launchd on macOS
 - **Platform-aware paths** — XDG on Linux, `~/Library/Application Support` on macOS, `%LOCALAPPDATA%` on Windows
 
-## How It Works
+## 🏛️ Software Architecture
 
+Piscord is architected as an event-driven gateway that bridges Discord's real-time WebSocket protocol to host-native agent execution environments without sandboxing, ensuring full access to GPUs, ROCm compute, local file systems, and systemd daemons.
+
+```mermaid
+graph TB
+    subgraph Discord ["Discord Platform"]
+        Client["Discord Client (Mobile / Desktop)"]
+        GatewayAPI["Discord Gateway & WebSocket API"]
+        Client <--> GatewayAPI
+    end
+
+    subgraph PiscordDaemon ["Piscord Gateway Daemon (systemd --user)"]
+        ClientMgr["Discord Client Manager (src/discord/client.ts)<br/>• Slash Commands (/pi, /kv)<br/>• Fast Mention Interceptor (@pi /kv)<br/>• Channel Policies & Typing State"]
+        MsgQueue["SQLite Message Queue (src/agent/queue.ts)<br/>• Per-channel Serial Queue<br/>• Concurrency Gate & Crash Recovery"]
+        ExtRunner["Extension Runner (src/agent/extension-runner.ts)<br/>• Dynamic Pi Extension Discovery<br/>• Transient RPC Session Manager<br/>• Fast Text & Slash Command Formatter"]
+        Scheduler["Task Scheduler (src/agent/scheduler.ts)<br/>• Cron & One-Time Triggers"]
+        Relay["Message & File Relay (src/agent/relay.ts)"]
+
+        GatewayAPI <--> ClientMgr
+        ClientMgr -->|Enqueue User Message| MsgQueue
+        ClientMgr -->|Direct Extension Command| ExtRunner
+        Scheduler -->|Inject Scheduled Turn| MsgQueue
+    end
+
+    subgraph Storage ["Persistence Layer (SQLite & Filesystem)"]
+        DB[("gateway.db (SQLite WAL)<br/>channels, message_queue, tasks")]
+        SessionDirs[("Per-channel Session Storage<br/>~/.local/share/piscord-gateway/sessions/")]
+        MsgQueue --- DB
+    end
+
+    subgraph PiSubsystem ["Pi Coding Agent & Inference Subsystem"]
+        PiAgent["Pi Coding Agent (@earendil-works/pi-coding-agent)<br/>CLI / JSON & RPC Modes"]
+        KvManager["pi-kv-cache-manager Extension<br/>(~/.pi/agent/extensions/pi-kv-cache-manager)"]
+        LruEngine["LRU Quota Engine<br/>• 30 Session Snapshots<br/>• 40 GB Storage Budget"]
+        LlamaServer["llama-server (AMD ROCm 7.x / GFX1151)<br/>Port 8001 | 520k Context Window"]
+        SlotCache[("~/.cache/llama-slots/<br/>base_system_prompt.bin<br/>session_*.bin + *.meta.json")]
+
+        MsgQueue -->|Spawn pi --continue| PiAgent
+        ExtRunner -->|Ephemeral RPC| PiAgent
+        PiAgent --> KvManager
+        KvManager --> LruEngine
+        KvManager -->|REST slot actions| LlamaServer
+        LruEngine --> SlotCache
+    end
 ```
-Discord ──discord.js──→ Gateway ──pi subprocess──→ Pi Agent
-                           │                          │
-                         SQLite                  Session dirs
-                      (message queue)           (per channel)
+
+---
+
+## 🔄 Detailed Workflows
+
+### 1. Extension Command Workflow (`/kv status` & `@pi /kv ...`)
+
+Extension commands bypass the message queue and LLM generation loop entirely, executing against an ephemeral RPC process to give instant status updates:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User as User (Discord)
+    participant Disc as Discord Gateway
+    participant Bot as piscord (client.ts)
+    participant Ext as Extension Runner (extension-runner.ts)
+    participant Pi as Pi Agent (Ephemeral RPC)
+    participant Kv as pi-kv-cache-manager
+    participant Llama as llama-server (:8001)
+
+    User->>Disc: Sends /kv status (or @pi /kv status)
+    Disc->>Bot: InteractionCreate (Slash) or MessageCreate (Text)
+    Bot->>Disc: Defer reply (thinking indicator)
+    Bot->>Ext: runExtensionCommand(channel, "kv", ["status"])
+    Ext->>Pi: Spawn ephemeral `pi --mode rpc`
+    Pi->>Kv: Load extensions & register slash commands
+    Ext->>Pi: RPC Request: execute_command("/kv status")
+    
+    Note over Kv,Llama: Query State & Disk Cache
+    Kv->>Llama: GET /slots/0 (query active slot status)
+    Kv->>Kv: Scan ~/.cache/llama-slots/*.meta.json (LRU count & usage)
+    Kv-->>Pi: Return formatted Markdown status table
+    Pi-->>Ext: Return RPC result
+    Ext-->>Bot: Clean markdown table
+    Bot->>Disc: Edit reply / Post message with status table
+    Disc-->>User: Display status in Discord channel
 ```
+
+### 2. Message Turn Processing with Golden Base KV Restore & Checkpointing
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User as User (Discord)
+    participant Disc as Discord Gateway
+    participant Bot as piscord (queue.ts)
+    participant Pi as Pi Agent (Child Process)
+    participant Kv as pi-kv-cache-manager
+    participant Llama as llama-server (:8001)
+
+    User->>Disc: @pi Run unit tests and fix errors
+    Disc->>Bot: MessageCreate
+    Bot->>Bot: Enqueue into SQLite message_queue
+    Bot->>Pi: Spawn `pi --session-dir <dir> --continue`
+    
+    Note over Pi,Llama: Golden Base Cache Check
+    Kv->>Kv: Compute SHA-256 of ctx.getSystemPrompt()
+    alt Cache Hit (base_system_prompt.meta.json matches)
+        Kv->>Llama: POST /slots/0?action=restore&filename=base_system_prompt.bin
+        Llama-->>Kv: 28k tokens restored into Slot 0 in ~50ms
+    else Cache Miss / Skills Changed
+        Kv->>Llama: Warm System Prompt & Tools
+        Kv->>Llama: POST /slots/0?action=save&filename=base_system_prompt.bin
+    end
+
+    Note over Pi,Llama: Prompt Evaluation & Streaming
+    Pi->>Llama: Evaluate user message (delta tokens only)
+    Llama-->>Pi: Stream response tokens
+    Pi-->>Bot: Stream stdout chunks
+    Bot->>Disc: Update Discord message with streamed response
+
+    Note over Pi,Kv: Checkpoint on Turn Completion
+    Pi->>Kv: Hook: turn_end
+    alt Context > minTokensThreshold (3,000 tokens)
+        Kv->>Llama: POST /slots/0?action=save&filename=session_<id>.bin
+        Llama-->>Kv: Slot snapshot saved to NVMe
+        Kv->>Kv: Enforce LRU Quota (Max 30 sessions, 40GB limit)
+    end
+```
+
+---
+
+## How It Works
 
 The gateway **does not embed or replace `pi`**. It finds and runs your installed `pi`:
 
@@ -67,6 +188,7 @@ The gateway **does not embed or replace `pi`**. It finds and runs your installed
 2. **Auth reuse** — `pi` reads its own `~/.pi/agent/auth.json` when invoked
 3. **Model catalog** — the gateway imports the pi SDK to populate slash command autocomplete
 4. **Invocation** — each message is processed as `pi --session-dir <dir> --continue -p <message>`
+5. **Extension Bridge** — dynamic slash commands (`/kv`) are discovered and routed through ephemeral RPC sessions
 
 ## Channel Policy
 
