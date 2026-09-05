@@ -290,6 +290,10 @@ export const config = {
 
   /** Max combined attachment size per Discord message in bytes (0 disables the limit) */
   maxTotalAttachmentBytes: envInt('MAX_TOTAL_ATTACHMENT_BYTES', 50 * 1024 * 1024, { min: 0 }),
+
+  /** Periodically update Discord bot custom presence with local GPU metrics */
+  gpuPresenceEnabled: envBool('GPU_PRESENCE_ENABLED', true),
+  gpuPresenceIntervalSec: envInt('GPU_PRESENCE_INTERVAL_SEC', 5, { min: 1 }),
 } as const;
 
 export type Config = typeof config;

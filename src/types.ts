@@ -12,6 +12,8 @@ export interface RegisteredChannel {
   modelOverride: string;
   thinkingOverride: ThinkingLevel | '';
   cwdOverride: string;
+  /** Whether thinking, tool calls, and tool results are shown for the current session. */
+  thinkingToolStatusEnabled: boolean;
 }
 
 /** Queued message row from SQLite */

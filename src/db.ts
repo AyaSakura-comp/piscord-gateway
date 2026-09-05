@@ -43,6 +43,7 @@ export function initDb(): void {
       model_override   text not null default '',
       thinking_override text not null default '',
       cwd_override     text not null default '',
+      thinking_tool_status_enabled integer not null default 1,
       created_at       text not null default (datetime('now'))
     );
 
@@ -88,6 +89,7 @@ export function initDb(): void {
   ensureTableColumn('channels', 'model_override', "text not null default ''");
   ensureTableColumn('channels', 'thinking_override', "text not null default ''");
   ensureTableColumn('channels', 'cwd_override', "text not null default ''");
+  ensureTableColumn('channels', 'thinking_tool_status_enabled', 'integer not null default 1');
   ensureTableColumn('message_queue', 'attachments', 'text');
 
   logger.info({ path: config.dbPath }, 'Database initialized');
@@ -118,8 +120,8 @@ function normalizeTimestamp(timestamp: string | null): string | null {
 export function registerChannel(ch: RegisteredChannel): void {
   db.prepare(
     `
-    insert into channels (jid, name, folder, requires_trigger, is_main, model_override, thinking_override, cwd_override)
-    values (?, ?, ?, ?, ?, ?, ?, ?)
+    insert into channels (jid, name, folder, requires_trigger, is_main, model_override, thinking_override, cwd_override, thinking_tool_status_enabled)
+    values (?, ?, ?, ?, ?, ?, ?, ?, ?)
     on conflict(jid) do update set
       name = excluded.name,
       folder = excluded.folder,
@@ -139,6 +141,7 @@ export function registerChannel(ch: RegisteredChannel): void {
     ch.modelOverride || '',
     ch.thinkingOverride || '',
     ch.cwdOverride.trim(),
+    ch.thinkingToolStatusEnabled ? 1 : 0,
   );
   logger.info({ jid: ch.jid, name: ch.name }, 'Channel registered');
 }
@@ -172,6 +175,7 @@ export function createDmChannel(
     modelOverride: '',
     thinkingOverride: '',
     cwdOverride: '',
+    thinkingToolStatusEnabled: true,
   };
 }
 
@@ -199,6 +203,20 @@ export function clearChannelThinkingOverride(jid: string): boolean {
   return result.changes > 0;
 }
 
+export function disableChannelThinkingToolStatus(jid: string): boolean {
+  const result = db
+    .prepare('update channels set thinking_tool_status_enabled = 0 where jid = ?')
+    .run(jid);
+  return result.changes > 0;
+}
+
+export function resetChannelThinkingToolStatus(jid: string): boolean {
+  const result = db
+    .prepare('update channels set thinking_tool_status_enabled = 1 where jid = ?')
+    .run(jid);
+  return result.changes > 0;
+}
+
 export function setChannelCwdOverride(jid: string, cwdOverride: string): boolean {
   const result = db
     .prepare('update channels set cwd_override = ? where jid = ?')
@@ -211,7 +229,6 @@ export function clearChannelCwdOverride(jid: string): boolean {
   return result.changes > 0;
 }
 
-
 function rowToChannel(row: any): RegisteredChannel {
   return {
     jid: row.jid,
@@ -222,6 +239,7 @@ function rowToChannel(row: any): RegisteredChannel {
     modelOverride: row.model_override || '',
     thinkingOverride: (row.thinking_override || '') as ThinkingLevel | '',
     cwdOverride: row.cwd_override || '',
+    thinkingToolStatusEnabled: row.thinking_tool_status_enabled !== 0,
   };
 }
 
@@ -300,9 +318,9 @@ export function markMessageAborted(rowid: number): void {
 }
 
 export function markMessagePending(rowid: number): void {
-  db.prepare(
-    "update message_queue set status = 'pending', processed_at = null where rowid = ?",
-  ).run(rowid);
+  db.prepare("update message_queue set status = 'pending', processed_at = null where rowid = ?").run(
+    rowid,
+  );
 }
 
 export function clearPendingMessages(channelJid: string): number {

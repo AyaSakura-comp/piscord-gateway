@@ -264,7 +264,9 @@ async function processMessage(
     // the user can watch what the agent is doing instead of staring at a
     // typing indicator. Final assistant text still falls through to the
     // outbox/marker path below.
-    const onEvent = createEventStreamer(jid);
+    const onEvent = createEventStreamer(jid, {
+      enabled: channel.thinkingToolStatusEnabled,
+    });
 
     // Persistent RPC session path (steer-able). Falls back to the one-shot
     // print path for attachments and the until-done loop, which the RPC prompt

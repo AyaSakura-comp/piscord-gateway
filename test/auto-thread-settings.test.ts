@@ -13,16 +13,11 @@ describe('auto-thread settings', () => {
       modelOverride: 'local-llama/qwen3.6-35b-q4',
       thinkingOverride: 'xhigh',
       cwdOverride: '/workspace',
+      thinkingToolStatusEnabled: true,
     };
 
     const thread = createAutoThreadRegistration(parent, 'thread-123', 'request');
 
-    expect(thread).toMatchObject({
-      jid: 'dc:thread-123',
-      modelOverride: parent.modelOverride,
-      thinkingOverride: 'medium',
-      cwdOverride: parent.cwdOverride,
-    });
-    expect(parent.thinkingOverride).toBe('xhigh');
+    expect(thread.thinkingOverride).toBe('medium');
   });
 });

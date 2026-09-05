@@ -38,7 +38,69 @@ afterEach(() => {
   }
 });
 
-describe('invokeAgent voice ASR integration', () => {
+describe('invokeAgent attachment integration', () => {
+  it('passes binary video attachments by path without inlining their bytes into pi context', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'pidg-invoke-video-'));
+    tempDirs.push(tempDir);
+    process.env.SESSIONS_DIR = join(tempDir, 'sessions');
+    process.env.PI_BIN = 'pi';
+    process.env.VOICE_ASR_ENABLED = 'false';
+
+    const videoPath = join(tempDir, 'clip.mp4');
+    writeFileSync(videoPath, Buffer.from([0, 0, 0, 24, 0x66, 0x74, 0x79, 0x70]));
+    downloadAttachmentsMock.mockResolvedValue([
+      { filePath: videoPath, originalName: 'clip.mp4', size: 8 },
+    ]);
+
+    spawnMock.mockImplementation(() => {
+      const proc = new EventEmitter() as EventEmitter & {
+        stdout: PassThrough;
+        stderr: PassThrough;
+        kill: ReturnType<typeof vi.fn>;
+      };
+      proc.stdout = new PassThrough();
+      proc.stderr = new PassThrough();
+      proc.kill = vi.fn();
+      setImmediate(() => {
+        proc.stdout.emit(
+          'data',
+          Buffer.from(
+            JSON.stringify({ type: 'message_start', message: { role: 'assistant' } }) +
+              '\n' +
+              JSON.stringify({
+                type: 'message_end',
+                message: { content: [{ type: 'text', text: 'ok' }] },
+              }) +
+              '\n',
+          ),
+        );
+        proc.emit('close', 0);
+      });
+      return proc;
+    });
+
+    const { invokeAgent } = await import('../src/agent/invoke.js');
+    const result = await invokeAgent('ch_video', '[Discord user: Aya]\nconvert this video', {
+      attachments: JSON.stringify([
+        {
+          url: 'https://discord.example/clip.mp4',
+          name: 'clip.mp4',
+          contentType: 'video/mp4',
+          size: 8,
+        },
+      ]),
+    });
+
+    expect(result).toEqual({ ok: true, text: 'ok' });
+    const args = spawnMock.mock.calls[0]?.[1] as string[];
+    const prompt = args[args.indexOf('-p') + 1];
+    expect(prompt).toContain(`[Binary attachment: ${videoPath}]`);
+    expect(prompt).toContain('Do not use the read tool on this binary file;');
+    expect(prompt).toContain('Use bash with ffprobe/ffmpeg');
+    expect(prompt).not.toContain(`<file name="${videoPath}"></file>`);
+    expect(args).not.toContain(`@${videoPath}`);
+  });
+
   it('transcribes downloaded Discord voice attachments before prompting pi', async () => {
     const tempDir = mkdtempSync(join(tmpdir(), 'pidg-invoke-voice-'));
     tempDirs.push(tempDir);
@@ -55,7 +117,9 @@ describe('invokeAgent voice ASR integration', () => {
 
     vi.stubGlobal(
       'fetch',
-      vi.fn(async () => new Response(JSON.stringify({ text: '這是語音轉文字內容' }), { status: 200 })),
+      vi.fn(
+        async () => new Response(JSON.stringify({ text: '這是語音轉文字內容' }), { status: 200 }),
+      ),
     );
 
     spawnMock.mockImplementation(() => {
@@ -86,16 +150,20 @@ describe('invokeAgent voice ASR integration', () => {
     });
 
     const { invokeAgent } = await import('../src/agent/invoke.js');
-    const result = await invokeAgent('ch_voice', '[Discord user: Aya]\n[Attachment-only message: 1 file attached.]', {
-      attachments: JSON.stringify([
-        {
-          url: 'https://discord.example/voice-message.ogg',
-          name: 'voice-message.ogg',
-          contentType: 'audio/ogg',
-          size: 1234,
-        },
-      ]),
-    });
+    const result = await invokeAgent(
+      'ch_voice',
+      '[Discord user: Aya]\n[Attachment-only message: 1 file attached.]',
+      {
+        attachments: JSON.stringify([
+          {
+            url: 'https://discord.example/voice-message.ogg',
+            name: 'voice-message.ogg',
+            contentType: 'audio/ogg',
+            size: 1234,
+          },
+        ]),
+      },
+    );
 
     expect(result).toEqual({ ok: true, text: 'ok' });
     const args = spawnMock.mock.calls[0]?.[1] as string[];

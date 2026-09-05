@@ -76,6 +76,7 @@ describe('channel cwd migration', () => {
         modelOverride: '',
         thinkingOverride: '',
         cwdOverride: '/workspace/project',
+        thinkingToolStatusEnabled: true,
       });
       expect(db.getChannel('dc:123')?.cwdOverride).toBe('/workspace/project');
 
@@ -88,6 +89,7 @@ describe('channel cwd migration', () => {
         modelOverride: '',
         thinkingOverride: '',
         cwdOverride: '',
+        thinkingToolStatusEnabled: true,
       });
       expect(db.getChannel('dc:123')).toMatchObject({
         name: 'legacy renamed',
@@ -130,6 +132,7 @@ describe('channel cwd migration', () => {
         modelOverride: '',
         thinkingOverride: '',
         cwdOverride: '',
+        thinkingToolStatusEnabled: true,
       });
 
       expect(db.getChannel('dc:456')?.cwdOverride).toBe('');

@@ -40,7 +40,7 @@ That's it. The setup wizard checks prerequisites, asks for your Discord bot toke
 - **SQLite message queue** — survives crashes, auto-recovers stuck messages
 - **Concurrency control** — per-channel serial processing + configurable global limit
 - **DM auto-registration** — direct messages work out of the box
-- **Discord slash commands** — `/pi status`, `/pi model`, `/pi thinking`, `/pi new`, `/pi stop`
+- **Discord slash commands** — `/pi status`, `/pi model`, `/pi thinking`, `/pi disable-thinking-tool-status`, `/pi new`, `/pi stop`
 - **Abort command** — `/pi stop` terminates the running task and clears queued messages
 - **Attachment relay** — Discord file uploads are downloaded and passed to `pi` via `@file`
 - **Message and file sending** — `piscord send` lets pi send plain text, files, or both to any Discord channel
@@ -94,14 +94,31 @@ Re-running `piscord register` with `--cwd` updates that channel's working direct
 
 The gateway registers a global `/pi` command on Discord:
 
-| Subcommand        | Description                                                        |
-| ----------------- | ------------------------------------------------------------------ |
-| `/pi status`      | Show model, thinking, working directory, session info, token usage |
-| `/pi model`       | Set the channel's model (autocomplete from pi's available models)  |
-| `/pi reset-model` | Clear the channel's model override                                 |
-| `/pi thinking`    | Set thinking level: off / minimal / low / medium / high / xhigh    |
-| `/pi new`         | Start a fresh session for this channel                             |
-| `/pi stop`        | Abort the current task and clear queued messages                   |
+| Subcommand                         | Description                                                         |
+| ---------------------------------- | ------------------------------------------------------------------- |
+| `/pi status`                       | Show model, thinking, working directory, session info, token usage  |
+| `/pi model`                        | Set the channel's model (autocomplete from pi's available models)   |
+| `/pi reset-model`                  | Clear the channel's model override                                  |
+| `/pi thinking`                     | Set thinking level: off / minimal / low / medium / high / xhigh     |
+| `/pi disable-thinking-tool-status` | Hide thinking, tool calls, and tool results for the current session |
+| `/pi new`                          | Start a fresh session and show thinking/tool status again           |
+| `/pi stop`                         | Abort the current task and clear queued messages                    |
+| `/pi kv`                           | Manage llama.cpp KV cache snapshots (action: status/save/restore/prune/base-update/help) |
+
+### KV Cache & Extension Slash Commands
+
+The gateway provides first-class support for llama.cpp KV cache management via both Discord slash commands and direct message triggers:
+
+| Command              | Description                                                          |
+| -------------------- | -------------------------------------------------------------------- |
+| `/kv status`         | Show KV cache snapshot table, active session tokens, and slot status |
+| `/kv save [name]`    | Save current session KV cache snapshot (optional custom name)        |
+| `/kv restore [name]` | Restore session or named snapshot                                    |
+| `/kv prune`          | Enforce LRU session count and storage quotas                         |
+| `/kv base-update`    | Re-evaluate and cache Golden Base System Prompt                      |
+| `/kv help`           | Show KV cache manager help and usage                                 |
+
+> **Note:** In Discord text channels or DMs, sending `@pi /kv status` (or `/kv status` in DMs) is intercepted and answered immediately by the extension runner without entering the message queue or consuming LLM generation turns.
 
 ## Tools for Pi
 

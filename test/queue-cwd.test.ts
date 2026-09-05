@@ -99,6 +99,7 @@ async function runQueuedMessage(cwdOverride: string): Promise<{ cwd?: string } |
       modelOverride: '',
       thinkingOverride: '',
       cwdOverride,
+      thinkingToolStatusEnabled: true,
     });
     db.enqueueMessage({
       channelJid: 'dc:123',

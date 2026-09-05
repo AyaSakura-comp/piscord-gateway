@@ -21,12 +21,95 @@ import type { AgentResult } from '../types.js';
  */
 export const UNTIL_DONE_MARKER = 'UNTIL_DONE_GOAL';
 
+// pi's CLI treats every non-image @file as UTF-8 text. Only pass known text
+// and image formats through @file; binary media must be referenced by path so
+// the agent can inspect/convert it with tools without polluting model context.
+const PI_INLINE_ATTACHMENT_EXTENSIONS = new Set([
+  'bmp',
+  'c',
+  'cc',
+  'conf',
+  'cpp',
+  'css',
+  'csv',
+  'gif',
+  'go',
+  'h',
+  'hpp',
+  'htm',
+  'html',
+  'ini',
+  'java',
+  'jpeg',
+  'jpg',
+  'js',
+  'json',
+  'jsx',
+  'log',
+  'md',
+  'mjs',
+  'png',
+  'py',
+  'rb',
+  'rs',
+  'sh',
+  'svg',
+  'toml',
+  'ts',
+  'tsx',
+  'txt',
+  'webp',
+  'xml',
+  'yaml',
+  'yml',
+]);
+
+function canPiInlineAttachment(filePath: string): boolean {
+  const extension = filePath.split('.').pop()?.toLowerCase() ?? '';
+  return PI_INLINE_ATTACHMENT_EXTENSIONS.has(extension);
+}
+
+function localBinaryFileReference(filePath: string): string {
+  return (
+    `[Binary attachment: ${filePath}]\n` +
+    'Do not use the read tool on this binary file; it only supports text and images and will corrupt the model context. ' +
+    'Use bash with ffprobe/ffmpeg or another format-aware command-line tool to inspect or convert it.'
+  );
+}
+
+const LLAMA_PARSER_ERROR_PREFIX = /^Failed to parse input at pos \d+:\s*/;
+
+/**
+ * llama.cpp can reject an otherwise complete response when the model emits a
+ * malformed UTF-8 byte sequence. Its error includes the generated output, so
+ * recover a normal answer after the closed thinking block when it is safe to
+ * do so. Never surface an unexecuted tool call as assistant text.
+ */
+export function recoverTextFromParserError(raw: string): string | undefined {
+  if (!LLAMA_PARSER_ERROR_PREFIX.test(raw)) return undefined;
+
+  const generated = raw.replace(LLAMA_PARSER_ERROR_PREFIX, '');
+  const thinkingEnd = generated.lastIndexOf('</think>');
+  if (thinkingEnd === -1) return undefined;
+
+  const answer = generated
+    .slice(thinkingEnd + '</think>'.length)
+    .replace(/<\|im_end\|>\s*$/, '')
+    .trim();
+  if (!answer || /<\/?tool_call>|<function=/i.test(answer)) return undefined;
+  return answer;
+}
+
 /**
  * Turn a pi in-stream error string into a concise, user-facing message.
  * Special-cases the ChatGPT/Codex `usage_limit_reached` 429 (the common one) into
  * a readable "額度用完，約 HH:MM 重置" line; otherwise returns the trimmed raw text.
  */
 export function formatStreamError(raw: string): string {
+  if (LLAMA_PARSER_ERROR_PREFIX.test(raw)) {
+    return '模型輸出格式解析失敗，請再試一次。';
+  }
+
   // pi formats provider errors as: `Codex error: { ...json... }`
   const jsonStart = raw.indexOf('{');
   if (jsonStart !== -1) {
@@ -156,14 +239,20 @@ export async function invokeAgent(
       }
 
       const transcribedAudioPaths = new Set(transcriptions.map((item) => item.filePath));
-      let forwardedCount = 0;
+      let inlinedCount = 0;
+      let referencedCount = 0;
       for (const file of downloaded) {
         if (transcribedAudioPaths.has(file.filePath)) continue;
-        args.push(`@${file.filePath}`);
-        forwardedCount += 1;
+        if (canPiInlineAttachment(file.filePath)) {
+          args.push(`@${file.filePath}`);
+          inlinedCount += 1;
+        } else {
+          promptText += `\n${localBinaryFileReference(file.filePath)}`;
+          referencedCount += 1;
+        }
       }
-      if (forwardedCount > 0) {
-        logger.info({ channelFolder, count: forwardedCount }, 'Attached files for pi');
+      if (inlinedCount > 0 || referencedCount > 0) {
+        logger.info({ channelFolder, inlinedCount, referencedCount }, 'Attached files for pi');
       }
     } catch (err: any) {
       logger.warn({ err: err.message }, 'Failed to process attachments');
@@ -355,11 +444,25 @@ export async function invokeAgent(
         return;
       }
 
-      // No assistant text but pi reported an in-stream error → surface it as an
-      // error to Discord instead of a useless "(empty response)".
+      // No assistant text but pi reported an in-stream error. llama.cpp may
+      // include a completed answer inside a parser error after malformed UTF-8;
+      // recover that answer before falling back to a concise user-facing error.
       if (!lastAssistantText && lastErrorMessage) {
+        const recoveredText = recoverTextFromParserError(lastErrorMessage);
+        if (recoveredText) {
+          logger.warn(
+            { channelFolder, error: lastErrorMessage.slice(0, 120) },
+            'Recovered assistant text from llama.cpp parser error',
+          );
+          resolve({ ok: true, text: recoveredText });
+          return;
+        }
+
         const friendly = formatStreamError(lastErrorMessage);
-        logger.warn({ channelFolder, error: lastErrorMessage.slice(0, 300) }, 'pi turn produced no text but reported an error');
+        logger.warn(
+          { channelFolder, error: lastErrorMessage.slice(0, 300) },
+          'pi turn produced no text but reported an error',
+        );
         resolve({ ok: false, text: '', error: friendly });
         return;
       }

@@ -21,7 +21,11 @@ import { mkdirSync } from 'node:fs';
 import { config } from '../config.js';
 import { logger } from '../logger.js';
 import { resolveChannelSessionDir } from '../session/path.js';
-import { formatStreamError, resolvePiSpawn } from './invoke.js';
+import {
+  formatStreamError,
+  recoverTextFromParserError,
+  resolvePiSpawn,
+} from './invoke.js';
 import type { AgentResult } from '../types.js';
 
 export interface RpcSessionOpts {
@@ -179,7 +183,16 @@ class RpcSession {
     if (turn.aborted) {
       turn.resolve({ ok: false, text: '', error: 'Agent invocation aborted', aborted: true });
     } else if (!turn.lastAssistantText && turn.lastError) {
-      turn.resolve({ ok: false, text: '', error: formatStreamError(turn.lastError) });
+      const recoveredText = recoverTextFromParserError(turn.lastError);
+      if (recoveredText) {
+        logger.warn(
+          { folder: this.folder, error: turn.lastError.slice(0, 120) },
+          'Recovered assistant text from llama.cpp parser error',
+        );
+        turn.resolve({ ok: true, text: recoveredText });
+      } else {
+        turn.resolve({ ok: false, text: '', error: formatStreamError(turn.lastError) });
+      }
     } else {
       turn.resolve({ ok: true, text: turn.lastAssistantText || '(empty response)' });
     }
@@ -201,10 +214,7 @@ class RpcSession {
         try {
           hooks.onFailed(error);
         } catch (hookError) {
-          logger.warn(
-            { folder: this.folder, err: String(hookError) },
-            'RPC steer failure hook failed',
-          );
+          logger.warn({ folder: this.folder, err: String(hookError) }, 'RPC steer failure hook failed');
         }
       }
       turn.resolve({ ok: false, text: '', error: error.message });
@@ -240,7 +250,10 @@ class RpcSession {
   }
 
   /** Run a new turn. Must only be called when not already streaming. */
-  prompt(message: string, onEvent?: (event: any) => void | Promise<void>): Promise<AgentResult> {
+  prompt(
+    message: string,
+    onEvent?: (event: any) => void | Promise<void>,
+  ): Promise<AgentResult> {
     this.ensureProc();
     this.clearIdleTimer();
     return new Promise<AgentResult>((resolve) => {
@@ -319,7 +332,11 @@ export function rpcSessionIsStreaming(folder: string): boolean {
 }
 
 /** Steer a message into the running turn. Returns false if not steer-able. */
-export function steerRpcSession(folder: string, message: string, hooks?: RpcSteerHooks): boolean {
+export function steerRpcSession(
+  folder: string,
+  message: string,
+  hooks?: RpcSteerHooks,
+): boolean {
   const session = sessions.get(keyFor(folder));
   if (!session || !session.isAlive || !session.isStreaming) return false;
   return session.steer(message, hooks);

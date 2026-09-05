@@ -83,6 +83,7 @@ describe('queue RPC abort handling', () => {
         modelOverride: '',
         thinkingOverride: '',
         cwdOverride: '',
+        thinkingToolStatusEnabled: true,
       });
       db.enqueueMessage({
         channelJid: 'dc:abort',

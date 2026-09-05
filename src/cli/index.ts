@@ -147,6 +147,7 @@ async function cliRegister(args: string[]): Promise<void> {
       modelOverride: existing?.modelOverride ?? '',
       thinkingOverride: existing?.thinkingOverride ?? '',
       cwdOverride: options.cwdOverride ?? existing?.cwdOverride ?? '',
+      thinkingToolStatusEnabled: existing?.thinkingToolStatusEnabled ?? true,
     };
 
     registerChannel(channel);

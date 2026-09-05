@@ -42,6 +42,7 @@ describe('stopChannelTask with a persistent RPC session', () => {
       modelOverride: '',
       thinkingOverride: '',
       cwdOverride: '',
+      thinkingToolStatusEnabled: true,
     });
     db.enqueueMessage({
       channelJid: 'dc:stop',

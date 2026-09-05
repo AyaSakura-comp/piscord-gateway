@@ -10,3 +10,4 @@ dist/
 
 sessions/
 *.tgz
+fetch_tokens.cjs
