@@ -40,6 +40,8 @@ import { isChannelProcessing, interruptChannelTask } from '../agent/queue.js';
 import { persistAndSteerMessage } from '../agent/durable-steer.js';
 import { rpcSessionIsStreaming } from '../agent/rpc-session.js';
 import { formatAttachmentTooLargeNotice, isAttachmentTooLargeError } from './send.js';
+import { startGpuPresenceMonitor, stopGpuPresenceMonitor } from './gpu-monitor.js';
+import { executePiExtensionCommand } from '../agent/extension-runner.js';
 
 let client: Client | null = null;
 let triggerPattern: RegExp;
@@ -90,6 +92,10 @@ export async function startDiscord(): Promise<void> {
         await registerGlobalCommands(ready);
       } catch (err: any) {
         logger.error({ err: err.message }, 'Failed to register global slash commands');
+      }
+
+      if (config.gpuPresenceEnabled) {
+        startGpuPresenceMonitor(ready, config.gpuPresenceIntervalSec);
       }
 
       resolve();
@@ -256,6 +262,7 @@ async function handleMessage(message: Message): Promise<void> {
       modelOverride: '',
       thinkingOverride: '',
       cwdOverride: '',
+      thinkingToolStatusEnabled: true,
     };
     dbRegisterChannel(reg);
     channel = reg;
@@ -283,6 +290,28 @@ async function handleMessage(message: Message): Promise<void> {
     content = buildAttachmentOnlyPrompt(acceptedAttachments.length);
   }
   if (!content) return;
+
+  // ── Direct extension slash command interception (e.g. /kv status) ──
+  if (content.startsWith('/kv')) {
+    const parts = content.slice(1).trim().split(/\s+/);
+    const cmd = parts.slice(0, 2).join(' ');
+    const rest = parts.slice(2).join(' ');
+    const args: Record<string, string> = {};
+    if (rest) args.name = rest;
+
+    try {
+      if ('sendTyping' in message.channel) {
+        await message.channel.sendTyping();
+      }
+      const result = await executePiExtensionCommand(channel, cmd, args);
+      const text = result.text || (result.ok ? '✅ Done.' : '⚠️ Command failed.');
+      const formatted = text.length > 1950 ? text.slice(0, 1950) + '\n...(truncated)' : text;
+      await message.reply(formatted);
+    } catch (err: any) {
+      await message.reply(`⚠️ ${err.message}`);
+    }
+    return;
+  }
 
   // ── Auto-thread ──
   // When enabled, a triggering message in a top-level guild text channel spins
@@ -977,6 +1006,7 @@ export async function setTyping(jid: string): Promise<void> {
 }
 
 export function stopDiscord(): void {
+  stopGpuPresenceMonitor();
   if (client) {
     client.destroy();
     client = null;
@@ -1024,6 +1054,7 @@ export function createAutoThreadRegistration(
     modelOverride: parent.modelOverride,
     thinkingOverride: 'medium',
     cwdOverride: parent.cwdOverride,
+    thinkingToolStatusEnabled: parent.thinkingToolStatusEnabled,
   };
 }
 

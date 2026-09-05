@@ -4,6 +4,8 @@ import { homedir } from 'node:os';
 import { resolve as pathResolve } from 'node:path';
 import { promisify } from 'node:util';
 import {
+  ApplicationIntegrationType,
+  InteractionContextType,
   MessageFlags,
   SlashCommandBuilder,
   type AutocompleteInteraction,
@@ -24,9 +26,11 @@ import {
   clearChannelModelOverride,
   clearPendingMessages,
   createDmChannel,
+  disableChannelThinkingToolStatus,
   enqueueMessage,
   getChannel,
   registerChannel,
+  resetChannelThinkingToolStatus,
   setChannelCwdOverride,
   setChannelModelOverride,
   setChannelThinkingOverride,
@@ -48,6 +52,7 @@ import {
 } from '../agent/channel-settings.js';
 import { isChannelProcessing, stopChannelTask } from '../agent/queue.js';
 import { closeRpcSession } from '../agent/rpc-session.js';
+import { executePiExtensionCommand } from '../agent/extension-runner.js';
 import { getAgyUsageReport } from '../agy-usage.js';
 import { rotateChannelSessionDir } from '../session/path.js';
 import type { RegisteredChannel } from '../types.js';
@@ -95,12 +100,15 @@ const PI_COMMAND = new SlashCommandBuilder()
       ),
   )
   .addSubcommand((sub) =>
+    sub
+      .setName('disable-thinking-tool-status')
+      .setDescription('Hide thinking, tool calls, and tool results for the current session'),
+  )
+  .addSubcommand((sub) =>
     sub.setName('new').setDescription('Start a fresh pi session for this channel'),
   )
   .addSubcommand((sub) =>
-    sub
-      .setName('stop')
-      .setDescription('Abort the current task while preserving the session and queue'),
+    sub.setName('stop').setDescription('Abort the current task while preserving the session and queue'),
   )
   .addSubcommand((sub) =>
     sub.setName('clear').setDescription('Delete queued messages without aborting the current task'),
@@ -124,6 +132,31 @@ const PI_COMMAND = new SlashCommandBuilder()
   )
   .addSubcommand((sub) =>
     sub.setName('agy-usage').setDescription('Show Antigravity (Gemini) quota usage'),
+  )
+  .addSubcommand((sub) =>
+    sub
+      .setName('kv')
+      .setDescription('Inspect or manage llama.cpp KV cache snapshots')
+      .addStringOption((option) =>
+        option
+          .setName('action')
+          .setDescription('Action: status (default), save, restore, prune, base-update, help')
+          .setRequired(false)
+          .addChoices(
+            { name: 'status', value: 'status' },
+            { name: 'save', value: 'save' },
+            { name: 'restore', value: 'restore' },
+            { name: 'prune', value: 'prune' },
+            { name: 'base-update', value: 'base-update' },
+            { name: 'help', value: 'help' },
+          ),
+      )
+      .addStringOption((option) =>
+        option
+          .setName('name')
+          .setDescription('Optional snapshot name')
+          .setRequired(false),
+      ),
   );
 
 const UNTIL_COMMAND = new SlashCommandBuilder()
@@ -144,22 +177,80 @@ const UNTIL_COMMAND = new SlashCommandBuilder()
     sub.setName('status').setDescription('Ask pi to report progress on the current goal'),
   )
   .addSubcommand((sub) =>
-    sub
-      .setName('stop')
-      .setDescription('Abort the current task while preserving the session and queue'),
+    sub.setName('stop').setDescription('Abort the current task while preserving the session and queue'),
   );
 
 const GPT_USAGE_COMMAND = new SlashCommandBuilder()
   .setName('gpt-usage')
   .setDescription('Show ChatGPT/Codex subscription rate-limit usage (Taiwan time)');
 
+const KV_COMMAND = new SlashCommandBuilder()
+  .setName('kv')
+  .setDescription('Inspect or manage llama.cpp KV cache snapshots')
+  .addSubcommand((sub) =>
+    sub
+      .setName('status')
+      .setDescription('Show current KV cache snapshot status, active tokens, and snapshot table'),
+  )
+  .addSubcommand((sub) =>
+    sub
+      .setName('save')
+      .setDescription('Save current session KV snapshot (optional custom name)')
+      .addStringOption((option) =>
+        option
+          .setName('name')
+          .setDescription('Optional custom snapshot name')
+          .setRequired(false),
+      ),
+  )
+  .addSubcommand((sub) =>
+    sub
+      .setName('restore')
+      .setDescription('Restore session or named snapshot')
+      .addStringOption((option) =>
+        option
+          .setName('name')
+          .setDescription('Optional snapshot name to restore')
+          .setRequired(false),
+      ),
+  )
+  .addSubcommand((sub) =>
+    sub
+      .setName('prune')
+      .setDescription('Enforce LRU session count and storage quotas'),
+  )
+  .addSubcommand((sub) =>
+    sub
+      .setName('base-update')
+      .setDescription('Re-evaluate and cache Golden Base System Prompt'),
+  )
+  .addSubcommand((sub) =>
+    sub
+      .setName('help')
+      .setDescription('Show KV cache manager help and usage'),
+  );
+
 export async function registerGlobalCommands(client: Client<true>): Promise<void> {
-  await client.application.commands.set([
-    PI_COMMAND.toJSON(),
-    UNTIL_COMMAND.toJSON(),
-    GPT_USAGE_COMMAND.toJSON(),
-  ]);
-  logger.info('Registered global slash commands');
+  // Discord only surfaces a global command inside a DM with the bot when the
+  // command declares the DM contexts explicitly. Left unset, `contexts` comes
+  // back null from the API and the commands are effectively guild-only — which
+  // is why /pi new, /pi stop and friends were missing in the pi-agent DM while
+  // they worked fine in the server.
+  const commands = [PI_COMMAND, UNTIL_COMMAND, GPT_USAGE_COMMAND, KV_COMMAND].map((command) =>
+    command
+      .setContexts(
+        InteractionContextType.Guild,
+        InteractionContextType.BotDM,
+        InteractionContextType.PrivateChannel,
+      )
+      .setIntegrationTypes(
+        ApplicationIntegrationType.GuildInstall,
+        ApplicationIntegrationType.UserInstall,
+      )
+      .toJSON(),
+  );
+  await client.application.commands.set(commands);
+  logger.info({ contexts: [0, 1, 2] }, 'Registered global slash commands');
 }
 
 export async function handleAutocomplete(interaction: AutocompleteInteraction): Promise<void> {
@@ -180,7 +271,8 @@ export async function handleChatCommand(interaction: ChatInputCommandInteraction
   if (
     interaction.commandName !== 'pi' &&
     interaction.commandName !== 'until' &&
-    interaction.commandName !== 'gpt-usage'
+    interaction.commandName !== 'gpt-usage' &&
+    interaction.commandName !== 'kv'
   )
     return;
 
@@ -190,6 +282,11 @@ export async function handleChatCommand(interaction: ChatInputCommandInteraction
   try {
     if (interaction.commandName === 'gpt-usage') {
       await handleGptUsage(interaction);
+      return;
+    }
+
+    if (interaction.commandName === 'kv') {
+      await handleKvCommand(interaction, subcommand);
       return;
     }
 
@@ -223,6 +320,9 @@ export async function handleChatCommand(interaction: ChatInputCommandInteraction
       case 'thinking':
         await handleThinkingSet(interaction);
         return;
+      case 'disable-thinking-tool-status':
+        await handleDisableThinkingToolStatus(interaction);
+        return;
       case 'new':
         await handleNew(interaction);
         return;
@@ -243,6 +343,9 @@ export async function handleChatCommand(interaction: ChatInputCommandInteraction
         return;
       case 'agy-usage':
         await handleAgyUsage(interaction);
+        return;
+      case 'kv':
+        await handlePiKvCommand(interaction);
         return;
       default:
         await interaction.reply(reply(`Unknown subcommand: ${subcommand}`, interaction));
@@ -288,6 +391,7 @@ async function handleNew(interaction: ChatInputCommandInteraction): Promise<void
   // that now lives in the archive. The next message simply spawns a fresh one.
   const closedRpc = closeRpcSession(channel.folder);
   const archivedSession = rotateChannelSessionDir(channel.folder);
+  resetChannelThinkingToolStatus(channel.jid);
 
   logger.info(
     { jid: channel.jid, cleared, archived: Boolean(archivedSession), closedRpc },
@@ -303,6 +407,24 @@ async function handleNew(interaction: ChatInputCommandInteraction): Promise<void
   }
 
   await interaction.reply(reply(notes.join('\n'), interaction));
+}
+
+async function handleDisableThinkingToolStatus(
+  interaction: ChatInputCommandInteraction,
+): Promise<void> {
+  const channel = ensureManagedChannel(interaction);
+  if (!channel) {
+    await interaction.reply(reply(notRegisteredMessage(), interaction));
+    return;
+  }
+
+  disableChannelThinkingToolStatus(channel.jid);
+  await interaction.reply(
+    reply(
+      'Thinking, tool calls, and tool results are hidden for this session. `/pi new` turns them back on.',
+      interaction,
+    ),
+  );
 }
 
 async function handleStop(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -746,4 +868,56 @@ async function handleCwdReset(interaction: ChatInputCommandInteraction): Promise
 
   await interaction.reply(reply('Working directory override reset to default for this channel.', interaction));
 }
+
+async function handleKvCommand(
+  interaction: ChatInputCommandInteraction,
+  subcommand: string | null,
+): Promise<void> {
+  const channel = ensureManagedChannel(interaction);
+  if (!channel) {
+    await interaction.reply(reply(notRegisteredMessage(), interaction));
+    return;
+  }
+
+  await interaction.deferReply(
+    interaction.inGuild() ? { flags: MessageFlags.Ephemeral } : undefined,
+  );
+
+  const sub = subcommand || 'status';
+  const name = interaction.options.getString('name') || '';
+  const args: Record<string, string> = {};
+  if (name) args.name = name;
+
+  const result = await executePiExtensionCommand(channel, `kv ${sub}`, args);
+  const text = result.text || (result.ok ? '✅ Done.' : '⚠️ Command failed.');
+  const formatted = text.length > 1950 ? text.slice(0, 1950) + '\n...(truncated)' : text;
+
+  await interaction.editReply({ content: formatted });
+}
+
+async function handlePiKvCommand(
+  interaction: ChatInputCommandInteraction,
+): Promise<void> {
+  const channel = ensureManagedChannel(interaction);
+  if (!channel) {
+    await interaction.reply(reply(notRegisteredMessage(), interaction));
+    return;
+  }
+
+  await interaction.deferReply(
+    interaction.inGuild() ? { flags: MessageFlags.Ephemeral } : undefined,
+  );
+
+  const action = interaction.options.getString('action') || 'status';
+  const name = interaction.options.getString('name') || '';
+  const args: Record<string, string> = {};
+  if (name) args.name = name;
+
+  const result = await executePiExtensionCommand(channel, `kv ${action}`, args);
+  const text = result.text || (result.ok ? '✅ Done.' : '⚠️ Command failed.');
+  const formatted = text.length > 1950 ? text.slice(0, 1950) + '\n...(truncated)' : text;
+
+  await interaction.editReply({ content: formatted });
+}
+
 
