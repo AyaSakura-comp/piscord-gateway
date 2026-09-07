@@ -225,7 +225,14 @@ The gateway registers a global `/pi` command on Discord:
 | `/pi disable-thinking-tool-status` | Hide thinking, tool calls, and tool results for the current session |
 | `/pi new`                          | Start a fresh session and show thinking/tool status again           |
 | `/pi stop`                         | Abort the current task and clear queued messages                    |
+| `/pi clear`                        | Delete queued messages without aborting current task                |
+| `/pi cwd`                          | Set working directory override for this channel                     |
+| `/pi reset-cwd`                    | Reset channel to gateway default working directory                  |
+| `/pi gpt-usage`                    | Show ChatGPT/Codex subscription rate-limit usage (Taiwan time)      |
+| `/pi agy-usage`                    | Show Antigravity (Gemini) quota usage                               |
 | `/pi kv`                           | Manage llama.cpp KV cache snapshots (action: status/save/restore/prune/base-update/help) |
+
+> **Note:** Configuration updates (`/pi model`, `/pi reset-model`, `/pi thinking`, `/pi cwd`, `/pi reset-cwd`) immediately retire any idle warm RPC process for the channel, ensuring subsequent prompts take effect with the new parameters.
 
 ### KV Cache & Extension Slash Commands
 

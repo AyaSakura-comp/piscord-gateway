@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+
+- **Warm RPC session invalidation on configuration changes**: modifying channel model (`/pi model`, `/pi reset-model`), thinking level (`/pi thinking`), or working directory (`/pi cwd`, `/pi reset-cwd`) now immediately closes the channel's idle warm RPC session so subsequent turns spawn fresh processes with the new settings.
+- **Proactive RPC session option matching**: `getRpcSession` now verifies that any surviving warm RPC process matches the current turn's effective model, thinking level, and working directory, automatically retiring and replacing mismatched sessions before prompt dispatch.
+
 ## [1.5.3] - 2026-05-19
 
 ### Fixed

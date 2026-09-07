@@ -66,6 +66,20 @@ class RpcSession {
     private readonly opts: RpcSessionOpts,
   ) {}
 
+  getOpts(): RpcSessionOpts {
+    return { ...this.opts };
+  }
+
+  matchesOpts(opts: RpcSessionOpts): boolean {
+    const currentCwd = this.opts.cwd || config.piCwd;
+    const nextCwd = opts.cwd || config.piCwd;
+    return (
+      (this.opts.model ?? '') === (opts.model ?? '') &&
+      (this.opts.thinking ?? '') === (opts.thinking ?? '') &&
+      currentCwd === nextCwd
+    );
+  }
+
   get isStreaming(): boolean {
     // A prompt is steer-able as soon as it has been written to the RPC process.
     // Waiting for agent_start leaves a startup race where a rapid follow-up
@@ -318,6 +332,15 @@ function keyFor(folder: string): string {
 export function getRpcSession(folder: string, opts: RpcSessionOpts): RpcSession {
   const key = keyFor(folder);
   let session = sessions.get(key);
+  if (session && !session.matchesOpts(opts)) {
+    logger.info(
+      { folder, oldOpts: session.getOpts(), newOpts: opts },
+      'Closing RPC session due to options change',
+    );
+    session.close();
+    sessions.delete(key);
+    session = undefined;
+  }
   if (!session) {
     session = new RpcSession(folder, opts);
     sessions.set(key, session);

@@ -560,6 +560,10 @@ async function handleModelSet(interaction: ChatInputCommandInteraction): Promise
     setChannelThinkingOverride(updated.jid, thinkingResolution.effective);
   }
 
+  if (!isChannelProcessing(channel.jid)) {
+    closeRpcSession(channel.folder);
+  }
+
   const notes = [`Model set to ${selectedModel.ref} for this channel.`];
   if (thinkingResolution.adjusted) {
     notes.push(
@@ -591,6 +595,10 @@ async function handleModelReset(interaction: ChatInputCommandInteraction): Promi
     setChannelThinkingOverride(updated.jid, effective.effectiveThinking);
   }
 
+  if (!isChannelProcessing(channel.jid)) {
+    closeRpcSession(channel.folder);
+  }
+
   if (effective.thinkingAdjusted) {
     const currentThinking = effective.hasManagedThinking
       ? effective.effectiveThinking
@@ -620,6 +628,10 @@ async function handleThinkingSet(interaction: ChatInputCommandInteraction): Prom
   const resolution = resolveThinkingForModel(effective.modelInfo, rawLevel);
 
   setChannelThinkingOverride(channel.jid, resolution.effective);
+
+  if (!isChannelProcessing(channel.jid)) {
+    closeRpcSession(channel.folder);
+  }
 
   const notes = [`Thinking level set to ${resolution.effective} for this channel.`];
   if (resolution.adjusted) {
@@ -849,6 +861,10 @@ async function handleCwdSet(interaction: ChatInputCommandInteraction): Promise<v
 
   setChannelCwdOverride(channel.jid, resolvedPath);
 
+  if (!isChannelProcessing(channel.jid)) {
+    closeRpcSession(channel.folder);
+  }
+
   const notes = [`Working directory override set to ${resolvedPath} for this channel.`];
   if (!pathExists) {
     notes.push(`⚠️ Note: The path does not exist or is not a directory on the host machine currently.`);
@@ -865,6 +881,10 @@ async function handleCwdReset(interaction: ChatInputCommandInteraction): Promise
   }
 
   clearChannelCwdOverride(channel.jid);
+
+  if (!isChannelProcessing(channel.jid)) {
+    closeRpcSession(channel.folder);
+  }
 
   await interaction.reply(reply('Working directory override reset to default for this channel.', interaction));
 }
