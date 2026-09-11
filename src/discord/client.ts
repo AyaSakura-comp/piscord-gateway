@@ -320,21 +320,8 @@ async function handleMessage(message: Message): Promise<void> {
   // Already-in-thread messages and DMs fall through unchanged.
   let targetJid = jid;
   if (config.autoThread && !isDM && !message.channel.isThread()) {
-    try {
-      const thread = await message.startThread({
-        name: buildThreadName(senderName, content),
-        autoArchiveDuration: ThreadAutoArchiveDuration.OneDay,
-      });
-      targetJid = `dc:${thread.id}`;
-      if (!getChannel(targetJid)) {
-        const threadReg = createAutoThreadRegistration(channel, thread.id, thread.name);
-        dbRegisterChannel(threadReg);
-        logger.info({ jid: targetJid, name: threadReg.name }, 'Opened and registered thread');
-      }
-    } catch (err: any) {
-      // Missing thread permissions, etc. — fall back to replying in-channel.
-      logger.warn({ jid, err: err.message }, 'Failed to open thread, replying in channel');
-    }
+    targetJid =
+      (await openAutoThread(message, channel, buildThreadName(senderName, content))) ?? jid;
   }
 
   // ── Steer (RPC mode) ──
@@ -1056,6 +1043,43 @@ export function createAutoThreadRegistration(
     cwdOverride: parent.cwdOverride,
     thinkingToolStatusEnabled: parent.thinkingToolStatusEnabled,
   };
+}
+
+/**
+ * Route a triggering message into its own thread, returning the jid to queue
+ * against, or null to stay in the parent channel.
+ *
+ * The thread jid is returned ONLY once its channel row exists. Routing to an
+ * unregistered jid loses the message outright: the queue finds no channel,
+ * logs "Channel disappeared during processing" and never answers, so the user
+ * sees the bot ignore a tag it plainly received. Any failure here — missing
+ * thread permissions, a rejected channels insert — falls back to the parent
+ * channel, which is always registered by the time we get here.
+ */
+export async function openAutoThread(
+  message: Message,
+  channel: RegisteredChannel,
+  threadName: string,
+): Promise<string | null> {
+  try {
+    const thread = await message.startThread({
+      name: threadName,
+      autoArchiveDuration: ThreadAutoArchiveDuration.OneDay,
+    });
+    const threadJid = `dc:${thread.id}`;
+    if (!getChannel(threadJid)) {
+      const threadReg = createAutoThreadRegistration(channel, thread.id, thread.name);
+      dbRegisterChannel(threadReg);
+      logger.info({ jid: threadJid, name: threadReg.name }, 'Opened and registered thread');
+    }
+    return threadJid;
+  } catch (err: any) {
+    logger.warn(
+      { jid: channel.jid, err: err.message },
+      'Failed to open thread, replying in channel',
+    );
+    return null;
+  }
 }
 
 function buildThreadName(senderName: string, content: string): string {
