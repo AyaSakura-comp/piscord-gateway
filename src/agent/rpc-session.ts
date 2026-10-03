@@ -44,6 +44,9 @@ interface PendingTurn {
   inAssistant: boolean;
   currentAssistantText: string;
   lastAssistantText: string;
+  /** Displayed extension messages (receipts/previews); reply fallback when no assistant text. */
+  displayedText: string;
+  agentStarted: boolean;
   lastError: string;
   userPromptPersisted: boolean;
   abortRequested: boolean;
@@ -148,6 +151,13 @@ class RpcSession {
       const errMsg = event?.message?.errorMessage ?? event?.errorMessage;
       if (typeof errMsg === 'string' && errMsg) turn.lastError = errMsg;
 
+      if (event.type === 'agent_start') turn.agentStarted = true;
+      if (event.type === 'message_end' && event.message?.role === 'custom' && event.message.display) {
+        const c = event.message.content;
+        const text = typeof c === 'string' ? c : (c || []).filter((x: any) => x?.type === 'text').map((x: any) => x.text).join('\n');
+        if (text) turn.displayedText = turn.displayedText ? `${turn.displayedText}\n\n${text}` : text;
+      }
+
       // Final assistant text — same accumulation as the print path.
       if (event.type === 'message_start' && event.message?.role === 'assistant') {
         turn.inAssistant = true;
@@ -174,6 +184,9 @@ class RpcSession {
     }
 
     if (event.type === 'agent_start' || event.type === 'turn_start') this.streaming = true;
+    // An extension consumed the prompt (input handler/command): no agent run
+    // and therefore no agent_settled will follow for this turn.
+    if (event.type === 'input_handled' && this.pending && !this.pending.agentStarted) this.finishTurn();
     // agent_end only closes one low-level run. Retry, compaction, or a queued
     // steering continuation may start another run immediately afterward.
     // agent_settled is the authoritative end of the whole session-level turn.
@@ -208,7 +221,7 @@ class RpcSession {
         turn.resolve({ ok: false, text: '', error: formatStreamError(turn.lastError) });
       }
     } else {
-      turn.resolve({ ok: true, text: turn.lastAssistantText || '(empty response)' });
+      turn.resolve({ ok: true, text: turn.lastAssistantText || turn.displayedText || '(empty response)' });
     }
     this.armIdleTimer();
   }
@@ -276,6 +289,8 @@ class RpcSession {
         inAssistant: false,
         currentAssistantText: '',
         lastAssistantText: '',
+        displayedText: '',
+        agentStarted: false,
         lastError: '',
         userPromptPersisted: false,
         abortRequested: false,
