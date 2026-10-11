@@ -190,6 +190,14 @@ export const config = {
   livePageAssetsDir: resolveUserPath(env('LIVE_PAGE_ASSETS_DIR', '~/src/piweb/public')),
   livePageDir: env('LIVE_PAGE_DIR', resolve(DEFAULT_DATA_DIR, 'live-pages')),
   livePageRetentionDays: envInt('LIVE_PAGE_RETENTION_DAYS', 7, { min: 0 }),
+  /**
+   * Post tables, display math and mermaid diagrams as images where they stand
+   * in the streamed reply (Discord renders none of them). Needs the page server.
+   */
+  liveRichImages: envBool('LIVE_RICH_IMAGES', true),
+  /** Device pixel ratio of those images; 3 stays sharp when zoomed on a phone. */
+  liveSnapshotScale: Number.parseFloat(env('LIVE_SNAPSHOT_SCALE', '3')) || 3,
+  liveSnapshotChrome: env('LIVE_SNAPSHOT_CHROME', '/usr/bin/google-chrome'),
 
   /** Default model for pi */
   piModel: env('PI_MODEL'),

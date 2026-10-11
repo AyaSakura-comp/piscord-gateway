@@ -35,9 +35,9 @@ describe('streamed Discord replies', () => {
   it('settles it on the attachment path too, sending only the files', () => {
     const files = CLIENT.slice(CLIENT.indexOf('export async function sendFilesResponse('));
     expect(files).toContain('const streamed = await finishLiveResponse(jid, text)');
-    expect(files).toContain('const bodyText = streamed ? \'\' : text');
+    expect(files).toContain('let bodyText = streamed ? \'\' : text');
     // A streamed reply with no surviving attachment must not append "(empty response)".
-    expect(files).toContain('if (streamed && !responseText) return true;');
+    expect(files).toContain('if ((streamed || sentRich) && !responseText) return true;');
   });
 
   it('throttles edits rather than editing per token', () => {
@@ -56,7 +56,7 @@ describe('streamed Discord replies', () => {
     // An empty final text deletes the preview rather than leaving a
     // half-written sentence standing as the answer.
     const fin = CLIENT.slice(CLIENT.indexOf('export async function finishLiveResponse('));
-    expect(fin).toMatch(/if \(!body\) \{[\s\S]*?for \(const message of live\.messages\) await message\.delete\(\)/);
+    expect(fin).toMatch(/if \(!finalText\?\.trim\(\)\) \{[\s\S]*?for \(const message of live\.messages\) await message\.delete\(\)/);
   });
 
   /**
@@ -462,7 +462,7 @@ describe('the tail of a sealed reply', () => {
     // pushLive is for live edits only; it early-returns with no message handle.
     expect(fin).not.toContain('pushLive(');
     const push = CLIENT.slice(CLIENT.indexOf('async function pushLive('));
-    expect(push.slice(0, 200)).toContain('if (!live?.message) return;');
+    expect(push.slice(0, 200)).toContain('if (!live?.message || live.cutting) return;');
   });
 
   it('never overwrites a message with the "…" placeholder', () => {

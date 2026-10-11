@@ -42,7 +42,14 @@ import { rpcSessionIsStreaming } from '../agent/rpc-session.js';
 import { formatAttachmentTooLargeNotice, isAttachmentTooLargeError } from './send.js';
 import { startGpuPresenceMonitor, stopGpuPresenceMonitor } from './gpu-monitor.js';
 import { executePiExtensionCommand } from '../agent/extension-runner.js';
-import { beginLivePage, completeLivePage, updateLivePage } from '../live-page/server.js';
+import {
+  beginLivePage,
+  completeLivePage,
+  richImagesActive,
+  updateLivePage,
+} from '../live-page/server.js';
+import { discordView, type Cut, type DiscordView } from '../live-page/blocks.js';
+import { renderBlockImage } from '../live-page/snapshot.js';
 
 let client: Client | null = null;
 let triggerPattern: RegExp;
@@ -418,6 +425,14 @@ interface LiveMessage {
   shown: string;
   /** The whole reply as of the last update, so a seal can flush it. */
   latest: string;
+  /** The reply as pi wrote it; `latest` is what Discord shows of it. */
+  raw: string;
+  /** Finished tables / math / diagrams already posted as images. */
+  cuts: number;
+  /** Serializes cuts, so finishing never races an image still being posted. */
+  cutChain?: Promise<void>;
+  /** While a cut is being posted, the throttled edits keep off the message. */
+  cutting?: boolean;
   /** Characters of the reply that earlier, finished messages consumed. */
   consumed: number;
   lastEditAt: number;
@@ -500,7 +515,7 @@ function liveSlice(live: LiveMessage, full: string): string {
 
 async function pushLive(jid: string, full: string): Promise<void> {
   const live = liveMessages.get(jid);
-  if (!live?.message) return;
+  if (!live?.message || live.cutting) return;
 
   let slice = liveSlice(live, full);
 
@@ -535,7 +550,7 @@ async function pushLive(jid: string, full: string): Promise<void> {
 }
 
 /** Open the message the reply is written into, resuming after a seal. */
-async function openLive(jid: string, full: string): Promise<void> {
+async function openLive(jid: string, full: string, raw = full): Promise<void> {
   const existing = liveMessages.get(jid);
   const channelId = jid.replace(/^dc:/, '');
   try {
@@ -556,6 +571,9 @@ async function openLive(jid: string, full: string): Promise<void> {
       channel,
       shown: body,
       latest: full,
+      raw,
+      cuts: existing?.cuts ?? 0,
+      cutChain: existing?.cutChain,
       consumed,
       lastEditAt: Date.now(),
     });
@@ -577,19 +595,33 @@ export async function updateLiveResponse(jid: string, full: string): Promise<voi
   // The link goes out as soon as the reply needs it (a table, math, length),
   // after the reply's first message so it never sits above the answer.
   const pageLink = updateLivePage(jid, full);
-  if (pageLink) {
+  // With blocks posted as images the link is a footnote: it goes after the
+  // reply instead of landing between its messages.
+  if (pageLink && richImagesActive()) pendingPageLinks.set(jid, pageLink);
+  else if (pageLink) {
     void (liveOpening.get(jid) ?? Promise.resolve())
       .catch(() => undefined)
       .then(() => postLivePageLink(jid, pageLink));
   }
 
+  // Discord sees the reply with finished tables, math and diagrams cut out
+  // (each goes up as an image where it stands) and a placeholder for one still
+  // being written. The web page above always gets the raw text.
+  const raw = full;
+  const view = richImagesActive() ? discordView(raw, false) : null;
+  full = view ? view.text : raw;
+
   const known = liveMessages.get(jid);
-  if (known) known.latest = full;
+  if (known) {
+    known.latest = full;
+    known.raw = raw;
+    if (view) await runCuts(known, view);
+  }
 
   if (!known?.message) {
     let opening = liveOpening.get(jid);
     if (!opening) {
-      opening = openLive(jid, full);
+      opening = openLive(jid, full, raw);
       liveOpening.set(jid, opening);
       // The opening message already carries `full` as of this delta; later
       // deltas fall through below and edit it with their newer text.
@@ -610,7 +642,7 @@ export async function updateLiveResponse(jid: string, full: string): Promise<voi
     if (live.timer) clearTimeout(live.timer);
     live.timer = setTimeout(() => {
       const current = liveMessages.get(jid);
-      if (!current) return;
+      if (!current || current.cutting) return;
       current.timer = undefined;
       void pushLive(jid, full).catch((err) =>
         logger.warn({ jid, err: err?.message }, 'live: throttled edit failed'),
@@ -623,6 +655,83 @@ export async function updateLiveResponse(jid: string, full: string): Promise<voi
   await pushLive(jid, full).catch((err) =>
     logger.warn({ jid, err: err?.message }, 'live: edit failed'),
   );
+}
+
+/**
+ * Post one finished block as an image where it stands in the reply.
+ *
+ * `content` is the text between the previous cut and this block. It goes into
+ * `target` (the message currently being streamed into, which may still show a
+ * "生成中" placeholder) or new messages, and the image rides on the last of
+ * them, so it sits directly under the sentence that introduced it. When the
+ * block cannot be rendered its Markdown is posted instead, so nothing is lost.
+ */
+async function postBlock(
+  channel: TextChannel | DMChannel,
+  target: Message | undefined,
+  content: string,
+  cut: Cut,
+  created: Message[],
+): Promise<void> {
+  const image = await renderBlockImage(cut.source);
+  const chunks = content.trim() ? splitMessage(content, DISCORD_MAX_LENGTH) : [];
+  if (!image) chunks.push(...splitMessage(cut.source, DISCORD_MAX_LENGTH));
+  if (!chunks.length) chunks.push('');
+  for (let k = 0; k < chunks.length; k++) {
+    const payload: { content: string; files?: AttachmentBuilder[] } = { content: chunks[k] };
+    if (image && k === chunks.length - 1)
+      payload.files = [new AttachmentBuilder(image, { name: `${cut.kind}.png` })];
+    if (k === 0 && target) await target.edit(payload);
+    else created.push(await channel.send(payload));
+  }
+}
+
+/** Post every block the reply has finished since the last call, in order. */
+async function applyCuts(live: LiveMessage, view: DiscordView): Promise<void> {
+  if (live.cuts >= view.cuts.length) return;
+  live.cutting = true;
+  if (live.timer) {
+    clearTimeout(live.timer);
+    live.timer = undefined;
+  }
+  try {
+    while (live.cuts < view.cuts.length) {
+      const cut = view.cuts[live.cuts];
+      const before = view.text.slice(live.consumed, Math.max(live.consumed, cut.at));
+      await postBlock(live.channel, live.message, before.replace(/\s+$/, ''), cut, live.messages);
+      // Whatever follows the block opens a fresh message below the image.
+      live.consumed = Math.max(live.consumed, cut.at);
+      live.shown = '';
+      live.message = undefined;
+      live.cuts++;
+      live.lastEditAt = Date.now();
+    }
+  } finally {
+    live.cutting = false;
+  }
+}
+
+function runCuts(live: LiveMessage, view: DiscordView): Promise<void> {
+  const next = (live.cutChain ?? Promise.resolve())
+    .then(() => applyCuts(live, view))
+    .catch((err) => logger.warn({ err: err?.message }, 'live: posting a block image failed'));
+  live.cutChain = next;
+  return next;
+}
+
+/**
+ * Send a whole reply that did not stream, with its blocks as images in place.
+ */
+async function sendRich(channel: TextChannel | DMChannel, text: string): Promise<void> {
+  const view = discordView(text, true);
+  const created: Message[] = [];
+  let at = 0;
+  for (const cut of view.cuts) {
+    await postBlock(channel, undefined, view.text.slice(at, cut.at).replace(/\s+$/, ''), cut, created);
+    at = cut.at;
+  }
+  const rest = view.text.slice(at).trim();
+  for (const chunk of rest ? splitMessage(rest, DISCORD_MAX_LENGTH) : []) await channel.send(chunk);
 }
 
 /**
@@ -714,10 +823,19 @@ export async function finishLiveResponse(jid: string, finalText: string): Promis
   liveMessages.delete(jid);
   liveClosed.add(jid);
   if (live.timer) clearTimeout(live.timer);
+  await live.cutChain;
 
-  const body = finalText?.trim() ?? '';
+  let body = finalText?.trim() ?? '';
+  // With rich blocks the offsets index what Discord shows, so compare and
+  // deliver in that form; the final views also close a block left at the end.
+  const rich = richImagesActive();
+  const bodyView = rich && body ? discordView(body, true) : null;
+  const streamView = rich ? discordView(live.raw, true) : null;
+  if (bodyView) body = bodyView.text;
   try {
-    if (!body) {
+    // Judge emptiness on what pi said: a reply that is only a table has no
+    // text left once the table becomes an image, and is not empty.
+    if (!finalText?.trim()) {
       // The turn produced nothing deliverable; drop the preview rather than
       // leaving a half-written sentence as the reply. Every message, not just
       // the open one — a sealed reply has already spilled into several.
@@ -729,7 +847,7 @@ export async function finishLiveResponse(jid: string, finalText: string): Promis
     // separately by the queue. In a multi-run turn (text, tools, more text)
     // those are not the same string, and slicing one by the other's offset
     // re-sent a whole block of the answer beneath the copy already there.
-    const streamed = live.latest;
+    const streamed = streamView ? streamView.text : live.latest;
     if (
       live.consumed > body.length ||
       body.slice(0, live.consumed) !== streamed.slice(0, live.consumed)
@@ -746,6 +864,7 @@ export async function finishLiveResponse(jid: string, finalText: string): Promis
       // end of the answer. Only take this path when the offset actually
       // indexes the text; otherwise fall through and repost in full.
       if (streamed.trim().endsWith(body) && live.consumed <= streamed.length) {
+        if (streamView) await applyCuts(live, streamView);
         await deliverRemainder(live, streamed);
         logger.info({ jid, length: streamed.length }, 'Response finalised (streamed in full)');
         return true;
@@ -758,6 +877,7 @@ export async function finishLiveResponse(jid: string, finalText: string): Promis
       return false; // the caller posts the whole reply normally
     }
 
+    if (bodyView) await applyCuts(live, bodyView);
     await deliverRemainder(live, body);
     logger.info({ jid, length: body.length }, 'Response finalised (streamed)');
     return true;
@@ -914,7 +1034,10 @@ export async function sendResponse(
 
     const textChannel = channel as TextChannel | DMChannel;
 
-    if (text.length <= DISCORD_MAX_LENGTH) {
+    if (options.settleLive !== false && richImagesActive()) {
+      // The answer, not thinking or tool status: blocks become images in place.
+      await sendRich(textChannel, text);
+    } else if (text.length <= DISCORD_MAX_LENGTH) {
       await textChannel.send(text);
     } else {
       // Split at line boundaries when possible
@@ -957,7 +1080,7 @@ async function sendFilesResponseOnce(
   // The text may already be on screen as a streamed message. Settle it there
   // and send only the attachments, instead of posting the whole reply twice.
   const streamed = await finishLiveResponse(jid, text);
-  const bodyText = streamed ? '' : text;
+  let bodyText = streamed ? '' : text;
 
   const channelId = jid.replace(/^dc:/, '');
 
@@ -987,6 +1110,14 @@ async function sendFilesResponseOnce(
       }
     }
 
+    // A reply with tables or math goes out with them as images first; the
+    // files then follow on their own.
+    let sentRich = false;
+    if (bodyText && richImagesActive() && discordView(bodyText, true).cuts.length) {
+      await sendRich(textChannel, bodyText);
+      bodyText = '';
+      sentRich = true;
+    }
     const responseText = [bodyText, ...notices].filter(Boolean).join('\n\n');
     const attachments = await Promise.all(
       valid.map(
@@ -998,7 +1129,7 @@ async function sendFilesResponseOnce(
     // text already went out as a streamed message there is nothing left to say,
     // so do not post "(empty response)" on top of a correct answer.
     if (attachments.length === 0) {
-      if (streamed && !responseText) return true;
+      if ((streamed || sentRich) && !responseText) return true;
       return sendResponse(jid, responseText || '(empty response)');
     }
 

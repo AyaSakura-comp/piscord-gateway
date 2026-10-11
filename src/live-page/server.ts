@@ -18,6 +18,7 @@ import { readFile, readdir, rename, stat, unlink, writeFile } from 'node:fs/prom
 import { extname, resolve, sep } from 'node:path';
 import { config } from '../config.js';
 import { logger } from '../logger.js';
+import { renderSnapHtml, stopSnapshots } from './snapshot.js';
 
 interface LivePage {
   id: string;
@@ -51,6 +52,11 @@ let cleanupTimer: NodeJS.Timeout | undefined;
 
 export function livePageActive(): boolean {
   return config.livePageEnabled && Boolean(config.livePagePublicUrl) && Boolean(server);
+}
+
+/** Whether blocks Discord cannot render should be posted as images. */
+export function richImagesActive(): boolean {
+  return livePageActive() && config.liveRichImages;
 }
 
 export function livePageUrl(id: string): string {
@@ -431,6 +437,11 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   const path = decodeURIComponent(url.pathname);
 
   if (path === '/healthz') return send(res, 200, 'text/plain', 'ok');
+  if (path === '/snap') {
+    res.setHeader('Content-Security-Policy', CSP);
+    res.setHeader('Cache-Control', 'no-store');
+    return send(res, 200, 'text/html; charset=utf-8', renderSnapHtml());
+  }
 
   const route = /^\/r\/([A-Za-z0-9_-]{22})(\/events|\.md)?$/.exec(path);
   if (route) {
@@ -517,6 +528,7 @@ export async function startLivePageServer(): Promise<() => void> {
     if (cleanupTimer) clearInterval(cleanupTimer);
     for (const page of pages.values()) for (const res of page.clients) res.end();
     for (const instance of listening) instance.close();
+    void stopSnapshots();
     server = undefined;
   };
 }
