@@ -122,4 +122,22 @@ describe('http surface', () => {
     expect(html).not.toContain('</script><script>alert(1)');
     expect(html).toMatch(/og:description" content="[^"]*&quot;quoted&quot;/);
   });
+
+  it('serves the local pictures a reply names, and nothing else', async () => {
+    const png = resolve(root, 'pic.png');
+    writeFileSync(png, 'PNGDATA');
+    writeFileSync(resolve(root, 'other.png'), 'OTHER');
+    live.beginLivePage('dc:img');
+    const url = live.updateLivePage('dc:img', `圖：\n[[image: ${png}]]\n\n${TABLE}`)!;
+    const html = await (await fetch(url.replace(/^.*\/r\//, `${base}/r/`))).text();
+    const img = /\/r\/[\w-]{22}\/img\/[0-9a-f]{20}/.exec(html)?.[0];
+    expect(img).toBeTruthy();
+    expect(html).not.toContain('[[image:');
+    const res = await fetch(`${base}${img}`);
+    expect(res.headers.get('content-type')).toBe('image/png');
+    expect(await res.text()).toBe('PNGDATA');
+    expect((await fetch(`${base}${img!.replace(/img\/.*/, `img/${'0'.repeat(20)}`)}`)).status).toBe(
+      404,
+    );
+  });
 });

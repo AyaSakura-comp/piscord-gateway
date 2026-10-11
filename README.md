@@ -301,8 +301,9 @@ Discord renders neither GFM tables, LaTeX nor mermaid. With `LIVE_PAGE_PUBLIC_UR
 
 1. **Mirrors the reply** onto `/r/<id>`, rendered with piweb's LobeHub Streamdown island (per-character fade, KaTeX, highlight.js, mermaid) and updated over Server-Sent Events as pi writes. The assets are served from piweb's `public/` directory (`LIVE_PAGE_ASSETS_DIR`), not vendored. Pages use 128-bit random ids, `noindex`, a strict CSP, and are kept for `LIVE_PAGE_RETENTION_DAYS`.
 2. **Posts blocks as images in place** (`LIVE_RICH_IMAGES`). While a block is still being written Discord shows `⏳ 表格生成中…`; once something after it proves it ended, a warm headless Chrome tab on the server's `/snap` page renders it (~0.1–0.7 s at `LIVE_SNAPSHOT_SCALE`× pixel density) and the image is attached to the message holding the text before it. The text after the block opens a new message, so the image lands exactly where it stood. A block that cannot be rendered is posted as Markdown instead.
-3. **Rewrites inline math** (`$(1+r)^n$` → `(1+r)ⁿ`); what cannot be expressed in Unicode stays as `code`. Code spans, fenced code and money (`$5 and $10`) are left alone.
-4. **Links the page** after the reply when it contained a table, math, a diagram, or more than 2000 characters (`LIVE_PAGE_MODE=auto`), or after every reply (`always`). The link suppresses Discord's embed, which would only ever show a stale snapshot.
+3. **Posts pictures in place** too: pi's `[[image: /path]]` outbox markers and Markdown images (`![alt](https://…)` from pages it read, or `![alt](/local/path)`) are attached where they stand instead of at the end of the reply; a run of images goes up as one gallery message (up to 10). Web images are downloaded by the gateway (http/https only, `image/*` responses within `MAX_ATTACHMENT_BYTES`, never addresses on this machine, a private network or the tailnet); one that cannot be fetched falls back to its bare link so Discord can still try a preview. `[[file:]]` / `[[video:]]` markers are still attached at the end. The web page serves the local pictures its reply names, so they show in place there as well.
+4. **Rewrites inline math** (`$(1+r)^n$` → `(1+r)ⁿ`); what cannot be expressed in Unicode stays as `code`. Code spans, fenced code and money (`$5 and $10`) are left alone.
+5. **Links the page** after the reply when it contained a table, math, a diagram, or more than 2000 characters (`LIVE_PAGE_MODE=auto`), or after every reply (`always`). The link suppresses Discord's embed, which would only ever show a stale snapshot.
 
 The page server must be reachable from the public internet for Discord users to open links — for example behind a Tailscale Funnel or reverse proxy pointing at `LIVE_PAGE_PORT`. `LIVE_PAGE_HOST` takes several comma-separated addresses (e.g. loopback plus a docker bridge a proxy container forwards from).
 
@@ -383,7 +384,7 @@ Most users won't need to edit this file directly — `piscord setup` generates i
 | `LIVE_PAGE_ASSETS_DIR`       | `~/src/piweb/public`            | piweb `public/` dir providing `lobehub-rich.js`, `markdown.js`, `app.css`, `vendor/` |
 | `LIVE_PAGE_DIR`              | _(platform default)_/live-pages | Where finished pages are stored                                            |
 | `LIVE_PAGE_RETENTION_DAYS`   | `7`                             | Days to keep pages (0 = forever)                                           |
-| `LIVE_RICH_IMAGES`           | `true`                          | Post tables / display math / mermaid as images in place                    |
+| `LIVE_RICH_IMAGES`           | `true`                          | Post tables / display math / mermaid / pictures as images in place         |
 | `LIVE_SNAPSHOT_SCALE`        | `3`                             | Device pixel ratio of those images                                         |
 | `LIVE_SNAPSHOT_CHROME`       | `/usr/bin/google-chrome`        | Chrome/Chromium binary used to render them                                 |
 

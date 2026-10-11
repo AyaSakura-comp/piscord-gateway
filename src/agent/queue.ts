@@ -23,6 +23,7 @@ import { invokeAgent, UNTIL_DONE_MARKER } from './invoke.js';
 import { invokeAgy, isAgyModelRef } from './agy.js';
 import { abortRpcSession, getRpcSession, closeAllRpcSessions } from './rpc-session.js';
 import { parseOutboxMarkers } from './outbox.js';
+import { richImagesActive } from '../live-page/server.js';
 import {
   discardLiveResponse,
   discardThinkingMessage,
@@ -324,7 +325,10 @@ async function processMessage(
 
     if (result.ok) {
       // Method C: extract [[image:/file:]] markers; attach those files, send the rest as text.
-      const { text: outText, files: outFiles } = parseOutboxMarkers(result.text);
+      // With rich replies, pictures stay in the text and go up where they stand.
+      const { text: outText, files: outFiles } = parseOutboxMarkers(result.text, undefined, {
+        keepImages: richImagesActive(),
+      });
       const sent =
         outFiles.length > 0
           ? await sendFilesResponse(jid, outText, outFiles)

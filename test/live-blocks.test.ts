@@ -111,3 +111,68 @@ describe('inline math', () => {
     expect(inlineMathToUnicode('$x^2$ and \\(y_1\\)')).toBe('x² and y₁');
   });
 });
+
+describe('images', () => {
+  const REPLY_IMG = [
+    '這是生成的圖：',
+    '[[image: /home/u/.pi-outbox/cat.png]]',
+    '',
+    '網路上找到的：',
+    '![地圖](https://example.com/map.webp "title")',
+    '![街景](<https://example.com/a b.jpg>)',
+    '結尾',
+  ].join('\n');
+
+  it('cuts outbox markers and Markdown images where they stand', () => {
+    const view = discordView(REPLY_IMG, true);
+    expect(view.cuts).toEqual([
+      { at: '這是生成的圖：'.length, kind: 'image', source: '/home/u/.pi-outbox/cat.png' },
+      {
+        at: view.text.indexOf('結尾'),
+        kind: 'image',
+        source: 'https://example.com/map.webp',
+        alt: '地圖',
+      },
+      {
+        at: view.text.indexOf('結尾'),
+        kind: 'image',
+        source: 'https://example.com/a b.jpg',
+        alt: '街景',
+      },
+    ]);
+    expect(view.text).toBe('這是生成的圖：網路上找到的：結尾');
+  });
+
+  it('leaves images inside code alone', () => {
+    const text = 'use `![x](y.png)` or\n```md\n![a](https://e.com/a.png)\n[[image: a.png]]\n```';
+    expect(discordView(text, true).cuts).toEqual([]);
+  });
+
+  it('never shows a half-typed image while streaming, and keeps earlier cuts stable', () => {
+    const final = discordView(REPLY_IMG, true);
+    for (let n = 1; n <= REPLY_IMG.length; n++) {
+      const view = discordView(REPLY_IMG.slice(0, n), false);
+      expect(view.text).not.toMatch(/\[\[|!\[|\]\(/);
+      for (const cut of view.cuts) {
+        expect(view.text.slice(0, cut.at)).toBe(final.text.slice(0, cut.at));
+      }
+    }
+  });
+
+  it('cuts an image mid-line, keeping the sentence around it', () => {
+    const view = discordView('看 ![圖](https://e.com/x.png) 這張', true);
+    expect(view.text).toBe('看這張');
+    expect(view.cuts[0].at).toBe(1);
+  });
+
+  it('waits for what follows an image, so a run of them goes up together', () => {
+    const two = '圖：\n![a](https://e.com/a.png)\n![b](https://e.com/b.png)\n';
+    expect(discordView(two.slice(0, two.indexOf('\n![b]')), false).cuts).toEqual([]);
+    expect(discordView(two, false).cuts).toEqual([]);
+    const view = discordView(`${two}後記`, false);
+    expect(view.cuts.map((c) => [c.alt, c.at])).toEqual([
+      ['a', 2],
+      ['b', 2],
+    ]);
+  });
+});

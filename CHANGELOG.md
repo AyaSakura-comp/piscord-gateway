@@ -7,6 +7,7 @@ All notable changes to this project will be documented in this file.
 ### Added
 
 - **Rich blocks as images in place**: GFM tables, display math (`$$…$$`, `\[…\]`) and mermaid diagrams are rendered by a warm headless Chrome tab (piweb's renderer, Discord dark palette, 3× pixel density) and posted exactly where they stand in the streamed reply — the message is cut at each finished block, the image rides on the text before it, and the text after opens a new message. A placeholder shows while a block is still being written; unrenderable blocks fall back to Markdown. Inline `$…$` math is rewritten to Unicode. Non-streamed replies take the same path.
+- **Pictures in place**: `[[image: …]]` outbox markers and Markdown images (`![alt](url)` from crawled pages, or local paths) are posted where they stand in the reply, consecutive ones grouped into one gallery message, instead of being attached at the end. Web images are downloaded with a private-address guard and fall back to a bare link; the live page serves the local pictures its reply names.
 - **Live web page**: every streamed reply is mirrored onto `/r/<id>`, rendered with piweb's LobeHub Streamdown renderer and updated over SSE while pi writes; Discord gets a link after replies that contain tables, math, diagrams or exceed 2000 characters (`LIVE_PAGE_MODE`). New settings: `LIVE_PAGE_*`, `LIVE_RICH_IMAGES`, `LIVE_SNAPSHOT_SCALE`, `LIVE_SNAPSHOT_CHROME`.
 
 ### Fixed

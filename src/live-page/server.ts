@@ -12,13 +12,14 @@
  * public/ directory (LIVE_PAGE_ASSETS_DIR), so the two front ends stay in step.
  */
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { readFile, readdir, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { extname, resolve, sep } from 'node:path';
 import { config } from '../config.js';
 import { logger } from '../logger.js';
 import { renderSnapHtml, stopSnapshots } from './snapshot.js';
+import { localImagePath } from './images.js';
 
 interface LivePage {
   id: string;
@@ -180,8 +181,52 @@ function scheduleBroadcast(page: LivePage): void {
   page.flushTimer.unref?.();
 }
 
+// ── local images ───────────────────────────────────────────────────────
+
+const LOCAL_IMAGE_EXT = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.avif', '.svg']);
+const PAGE_IMAGE =
+  /\[\[image\s*:\s*([^\]\n]+?)\s*\]\]|!\[([^\]\n]*)\]\(\s*<?((?:\/|~\/|file:\/\/)[^\s()<>]+)>?\s*\)/gi;
+
+const imageKey = (path: string) => createHash('sha256').update(path).digest('hex').slice(0, 20);
+
+function pageImagePath(source: string): string | null {
+  const path = localImagePath(source.trim().replace(/^['"<]+|['">]+$/g, ''));
+  return path && LOCAL_IMAGE_EXT.has(extname(path).toLowerCase()) ? path : null;
+}
+
+/**
+ * The reply as the browser gets it. Pictures pi saved on this machine
+ * (`[[image: /path]]`, `![](/path)`) are served from the page itself, and
+ * only the ones its reply names, so the page shows them in place too.
+ */
+function pageText(page: { id: string; text: string }): string {
+  return page.text.replace(PAGE_IMAGE, (match, marker?: string, alt?: string, src?: string) => {
+    const path = pageImagePath(marker ?? src ?? '');
+    if (!path) return match;
+    const label = (alt ?? path.split('/').pop() ?? '').replace(/[[\]]/g, '');
+    return `![${label}](/r/${page.id}/img/${imageKey(path)})`;
+  });
+}
+
+async function servePageImage(res: ServerResponse, page: LivePage, key: string): Promise<void> {
+  for (const m of page.text.matchAll(PAGE_IMAGE)) {
+    const path = pageImagePath(m[1] ?? m[3] ?? '');
+    if (!path || imageKey(path) !== key) continue;
+    try {
+      const body = await readFile(path);
+      res.setHeader('Cache-Control', 'private, max-age=3600');
+      // An SVG could carry script; the CSP keeps it inert when opened directly.
+      res.setHeader('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'");
+      return send(res, 200, MIME[extname(path).toLowerCase()] ?? 'application/octet-stream', body);
+    } catch {
+      break;
+    }
+  }
+  send(res, 404, 'text/plain', 'not found');
+}
+
 function broadcast(page: LivePage): void {
-  const frame = `data: ${JSON.stringify({ text: page.text, complete: page.complete })}\n\n`;
+  const frame = `data: ${JSON.stringify({ text: pageText(page), complete: page.complete })}\n\n`;
   for (const res of page.clients) res.write(frame);
 }
 
@@ -261,6 +306,11 @@ const MIME: Record<string, string> = {
   '.ttf': 'font/ttf',
   '.svg': 'image/svg+xml',
   '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+  '.avif': 'image/avif',
 };
 
 /** Only the renderer's files are served out of piweb's public/ directory. */
@@ -331,10 +381,11 @@ export function renderPageHtml(page: { id: string; text: string; complete: boole
   const description = previewDescription(page.text) || '即時渲染的回覆';
   // The initial state rides along so a finished page renders without waiting
   // for the event stream, and `<` cannot close the script element early.
-  const initial = JSON.stringify({ id: page.id, text: page.text, complete: page.complete }).replace(
-    /</g,
-    '\\u003c',
-  );
+  const initial = JSON.stringify({
+    id: page.id,
+    text: pageText(page),
+    complete: page.complete,
+  }).replace(/</g, '\\u003c');
   return `<!doctype html>
 <html lang="zh-Hant" data-theme="dark">
 <head>
@@ -443,10 +494,11 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     return send(res, 200, 'text/html; charset=utf-8', renderSnapHtml());
   }
 
-  const route = /^\/r\/([A-Za-z0-9_-]{22})(\/events|\.md)?$/.exec(path);
+  const route = /^\/r\/([A-Za-z0-9_-]{22})(\/events|\.md|\/img\/([0-9a-f]{20}))?$/.exec(path);
   if (route) {
     const page = await loadPage(route[1]);
     if (!page) return send(res, 404, 'text/plain; charset=utf-8', '找不到這個頁面（可能已過期）');
+    if (route[3]) return servePageImage(res, page, route[3]);
     if (route[2] === '.md') {
       res.setHeader('Cache-Control', 'no-store');
       return send(res, 200, 'text/markdown; charset=utf-8', page.text);
@@ -459,7 +511,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
         'X-Accel-Buffering': 'no',
       });
       res.write(
-        `retry: 2000\ndata: ${JSON.stringify({ text: page.text, complete: page.complete })}\n\n`,
+        `retry: 2000\ndata: ${JSON.stringify({ text: pageText(page), complete: page.complete })}\n\n`,
       );
       if (page.complete) return void res.end();
       page.clients.add(res);

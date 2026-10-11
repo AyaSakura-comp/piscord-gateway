@@ -1,5 +1,5 @@
 import { existsSync, statSync } from 'node:fs';
-import { isAbsolute, resolve } from 'node:path';
+import { extname, isAbsolute, resolve } from 'node:path';
 import { homedir } from 'node:os';
 
 /**
@@ -15,21 +15,44 @@ import { homedir } from 'node:os';
  * parseOutboxMarkers extracts the referenced files (that actually exist) and
  * returns the reply text with the markers removed.
  */
-const MARKER_RE = /\[\[(?:image|video|file)\s*:\s*([^\]]+?)\s*\]\]/gi;
+const MARKER_RE = /\[\[(image|video|file)\s*:\s*([^\]]+?)\s*\]\]/gi;
+const INLINE_IMAGE_EXT = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.avif']);
 
 export interface OutboxResult {
   text: string;
   files: string[];
 }
 
-export function parseOutboxMarkers(raw: string, baseDir: string = homedir()): OutboxResult {
+export interface OutboxOptions {
+  /**
+   * Leave `[[image: …]]` markers for pictures in the text instead of
+   * collecting them: the rich reply path posts each where it stands.
+   */
+  keepImages?: boolean;
+}
+
+/** An image marker the rich reply path posts in place rather than at the end. */
+function staysInline(kind: string, path: string, options: OutboxOptions): boolean {
+  return (
+    Boolean(options.keepImages) &&
+    kind.toLowerCase() === 'image' &&
+    INLINE_IMAGE_EXT.has(extname(path).toLowerCase())
+  );
+}
+
+export function parseOutboxMarkers(
+  raw: string,
+  baseDir: string = homedir(),
+  options: OutboxOptions = {},
+): OutboxResult {
   const files: string[] = [];
   const seen = new Set<string>();
   let m: RegExpExecArray | null;
   MARKER_RE.lastIndex = 0;
   while ((m = MARKER_RE.exec(raw)) !== null) {
     // strip surrounding quotes or markdown angle brackets the model might add
-    const p = m[1].trim().replace(/^['"<]+|['">]+$/g, '');
+    const p = m[2].trim().replace(/^['"<]+|['">]+$/g, '');
+    if (staysInline(m[1], p, options)) continue;
     if (!p) continue;
     const abs = isAbsolute(p) ? p : resolve(baseDir, p);
     if (seen.has(abs)) continue;
@@ -44,7 +67,9 @@ export function parseOutboxMarkers(raw: string, baseDir: string = homedir()): Ou
   }
 
   const text = raw
-    .replace(MARKER_RE, '')
+    .replace(MARKER_RE, (marker, kind: string, path: string) =>
+      staysInline(kind, path.trim().replace(/^['"<]+|['">]+$/g, ''), options) ? marker : '',
+    )
     .replace(/\n{3,}/g, '\n\n')
     .trim();
 

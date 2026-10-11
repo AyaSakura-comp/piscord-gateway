@@ -50,6 +50,7 @@ import {
 } from '../live-page/server.js';
 import { discordView, type Cut, type DiscordView } from '../live-page/blocks.js';
 import { renderBlockImage } from '../live-page/snapshot.js';
+import { imageFallbackText, loadImage } from '../live-page/images.js';
 
 let client: Client | null = null;
 let triggerPattern: RegExp;
@@ -285,8 +286,7 @@ async function handleMessage(message: Message): Promise<void> {
   // ── Trigger check ──
   // `alwaysRequireTrigger` forces the prefix for guild channels and threads,
   // but DMs (1-on-1 personal context) are exempt unless channel-specific policy requires it.
-  const mustTrigger =
-    channel.requiresTrigger || (config.alwaysRequireTrigger && !isDM);
+  const mustTrigger = channel.requiresTrigger || (config.alwaysRequireTrigger && !isDM);
   if (mustTrigger && !triggerPattern.test(content)) {
     logger.debug({ jid }, 'Message does not match trigger, ignoring');
     return;
@@ -378,7 +378,10 @@ async function handleMessage(message: Message): Promise<void> {
       try {
         await message.reply('interrupt');
       } catch (err: any) {
-        logger.warn({ jid: targetJid, err: err.message }, 'Failed to send interrupt acknowledgement');
+        logger.warn(
+          { jid: targetJid, err: err.message },
+          'Failed to send interrupt acknowledgement',
+        );
       }
     }
   }
@@ -392,10 +395,7 @@ async function handleMessage(message: Message): Promise<void> {
     timestamp,
     attachments: attachmentsJson,
   });
-  logger.info(
-    { jid: targetJid, sender: senderName, len: content.length },
-    'Message enqueued',
-  );
+  logger.info({ jid: targetJid, sender: senderName, len: content.length }, 'Message enqueued');
 }
 
 // ── Outbound ──
@@ -562,7 +562,7 @@ async function openLive(jid: string, full: string, raw = full): Promise<void> {
     }
     const consumed = existing?.consumed ?? 0;
     const body = full.slice(consumed, consumed + DISCORD_MAX_LENGTH);
-    if (!body.trim()) return;
+    if (!body.trim() || liveClosed.has(jid)) return;
     const message = await channel.send(body);
     logger.info({ jid, resumed: Boolean(existing) }, 'Streaming reply opened');
     liveMessages.set(jid, {
@@ -616,6 +616,9 @@ export async function updateLiveResponse(jid: string, full: string): Promise<voi
     known.latest = full;
     known.raw = raw;
     if (view) await runCuts(known, view);
+    // Posting an image can take seconds (a web download); the reply may have
+    // been settled meanwhile, and reopening would post it a second time.
+    if (liveClosed.has(jid)) return;
   }
 
   if (!known?.message) {
@@ -658,32 +661,62 @@ export async function updateLiveResponse(jid: string, full: string): Promise<voi
 }
 
 /**
- * Post one finished block as an image where it stands in the reply.
+ * Post finished blocks as images where they stand in the reply.
  *
- * `content` is the text between the previous cut and this block. It goes into
+ * `content` is the text between the previous cut and these blocks. It goes into
  * `target` (the message currently being streamed into, which may still show a
- * "生成中" placeholder) or new messages, and the image rides on the last of
- * them, so it sits directly under the sentence that introduced it. When the
- * block cannot be rendered its Markdown is posted instead, so nothing is lost.
+ * "生成中" placeholder) or new messages, and the images ride on the last of
+ * them, so they sit directly under the sentence that introduced them. Several
+ * images in a row share one message, like a gallery. A block that cannot be
+ * rendered or loaded is posted as text instead, so nothing is lost.
  */
 async function postBlock(
   channel: TextChannel | DMChannel,
   target: Message | undefined,
   content: string,
-  cut: Cut,
+  cuts: Cut[],
   created: Message[],
 ): Promise<void> {
-  const image = await renderBlockImage(cut.source);
-  const chunks = content.trim() ? splitMessage(content, DISCORD_MAX_LENGTH) : [];
-  if (!image) chunks.push(...splitMessage(cut.source, DISCORD_MAX_LENGTH));
-  if (!chunks.length) chunks.push('');
+  const images = await Promise.all(
+    cuts.map(async (cut) => {
+      if (cut.kind === 'image') return loadImage(cut.source);
+      const png = await renderBlockImage(cut.source);
+      return png && { data: png, name: `${cut.kind}.png` };
+    }),
+  );
+  const fallback = cuts
+    .map((cut, k) =>
+      images[k] ? '' : cut.kind === 'image' ? imageFallbackText(cut.source, cut.alt) : cut.source,
+    )
+    .filter(Boolean)
+    .join('\n\n');
+  const text = [content.trim() ? content : '', fallback].filter(Boolean).join('\n\n');
+  const chunks = text ? splitMessage(text, DISCORD_MAX_LENGTH) : [''];
+  const files = images.flatMap((image) =>
+    image ? [new AttachmentBuilder(image.data, { name: image.name })] : [],
+  );
   for (let k = 0; k < chunks.length; k++) {
     const payload: { content: string; files?: AttachmentBuilder[] } = { content: chunks[k] };
-    if (image && k === chunks.length - 1)
-      payload.files = [new AttachmentBuilder(image, { name: `${cut.kind}.png` })];
+    if (files.length && k === chunks.length - 1) payload.files = files;
     if (k === 0 && target) await target.edit(payload);
     else created.push(await channel.send(payload));
   }
+}
+
+/** Discord takes up to 10 attachments per message. */
+const MAX_FILES_PER_MESSAGE = 10;
+
+/** How many cuts from `from` go up together: a run of images at one spot. */
+function cutGroup(cuts: Cut[], from: number): number {
+  if (cuts[from].kind !== 'image') return 1;
+  let n = 1;
+  while (
+    n < MAX_FILES_PER_MESSAGE &&
+    cuts[from + n]?.kind === 'image' &&
+    cuts[from + n].at === cuts[from].at
+  )
+    n++;
+  return n;
 }
 
 /** Post every block the reply has finished since the last call, in order. */
@@ -696,14 +729,15 @@ async function applyCuts(live: LiveMessage, view: DiscordView): Promise<void> {
   }
   try {
     while (live.cuts < view.cuts.length) {
-      const cut = view.cuts[live.cuts];
-      const before = view.text.slice(live.consumed, Math.max(live.consumed, cut.at));
-      await postBlock(live.channel, live.message, before.replace(/\s+$/, ''), cut, live.messages);
+      const group = view.cuts.slice(live.cuts, live.cuts + cutGroup(view.cuts, live.cuts));
+      const at = group[0].at;
+      const before = view.text.slice(live.consumed, Math.max(live.consumed, at));
+      await postBlock(live.channel, live.message, before.replace(/\s+$/, ''), group, live.messages);
       // Whatever follows the block opens a fresh message below the image.
-      live.consumed = Math.max(live.consumed, cut.at);
+      live.consumed = Math.max(live.consumed, at);
       live.shown = '';
       live.message = undefined;
-      live.cuts++;
+      live.cuts += group.length;
       live.lastEditAt = Date.now();
     }
   } finally {
@@ -726,9 +760,12 @@ async function sendRich(channel: TextChannel | DMChannel, text: string): Promise
   const view = discordView(text, true);
   const created: Message[] = [];
   let at = 0;
-  for (const cut of view.cuts) {
-    await postBlock(channel, undefined, view.text.slice(at, cut.at).replace(/\s+$/, ''), cut, created);
-    at = cut.at;
+  for (let k = 0; k < view.cuts.length; ) {
+    const group = view.cuts.slice(k, k + cutGroup(view.cuts, k));
+    const content = view.text.slice(at, group[0].at).replace(/\s+$/, '');
+    await postBlock(channel, undefined, content, group, created);
+    at = group[0].at;
+    k += group.length;
   }
   const rest = view.text.slice(at).trim();
   for (const chunk of rest ? splitMessage(rest, DISCORD_MAX_LENGTH) : []) await channel.send(chunk);
@@ -1070,11 +1107,7 @@ export async function sendFilesResponse(
   return sent;
 }
 
-async function sendFilesResponseOnce(
-  jid: string,
-  text: string,
-  files: string[],
-): Promise<boolean> {
+async function sendFilesResponseOnce(jid: string, text: string, files: string[]): Promise<boolean> {
   if (!client) return false;
 
   // The text may already be on screen as a streamed message. Settle it there

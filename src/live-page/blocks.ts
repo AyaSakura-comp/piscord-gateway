@@ -1,7 +1,8 @@
 /**
  * Split a (possibly still streaming) Markdown reply into what Discord can show
- * as text and the blocks it cannot: GFM tables, display math and mermaid
- * diagrams. Those are rendered to images and posted where they stand in the
+ * as text and the blocks it cannot: GFM tables, display math, mermaid diagrams
+ * and images (`![alt](src)` or pi's `[[image: path]]` outbox marker). Blocks
+ * are rendered (or, for images, fetched) and posted where they stand in the
  * reply, so the text around them keeps flowing into ordinary messages.
  *
  * Everything here is pure and works on a growing string: a block counts as
@@ -9,11 +10,11 @@
  * complete), so a half-written table is never photographed.
  */
 
-export type BlockKind = 'table' | 'math' | 'mermaid';
+export type BlockKind = 'table' | 'math' | 'mermaid' | 'image';
 
 export type Segment =
   | { type: 'text'; text: string }
-  | { type: 'block'; kind: BlockKind; source: string; done: boolean };
+  | { type: 'block'; kind: BlockKind; source: string; done: boolean; alt?: string };
 
 const FENCE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
 const TABLE_ROW = /^\s*\|/;
@@ -110,14 +111,95 @@ export function segmentReply(text: string, complete: boolean): Segment[] {
   }
   if (cursor < text.length) segments.push({ type: 'text', text: text.slice(cursor) });
   // A tail block that was cut short leaves nothing after it to emit.
-  return segments.filter((s) => s.type === 'block' || s.text.length);
+  return segments
+    .flatMap((s, k, all) =>
+      s.type === 'text' ? splitImages(s.text, !complete && k === all.length - 1) : [s],
+    )
+    .filter((s) => s.type === 'block' || s.text.length);
+}
+
+/** pi's outbox marker for an image (see agent/outbox.ts). */
+const IMAGE_MARKER = /\[\[image\s*:\s*([^\]\n]+?)\s*\]\]/gi;
+/** `![alt](src)`, `![alt](<src>)`, optionally with a "title". */
+const IMAGE_MARKDOWN =
+  /!\[([^\]\n]*)\]\(\s*(<[^>\n]+>|[^\s()]+(?:\([^\s()]*\)[^\s()]*)*)(?:\s+(?:"[^"\n]*"|'[^'\n]*'))?\s*\)/g;
+
+/**
+ * Pull images out of a text segment, leaving code (fenced or inline) alone.
+ * A half-typed image is held back by discordView. A whole one at the very end
+ * of a streaming reply waits for what follows, so a run of images can go up
+ * together as one gallery message.
+ */
+function splitImages(text: string, atTail: boolean): Segment[] {
+  const found: Array<{ start: number; end: number; source: string; alt: string }> = [];
+  let fence: string | null = null;
+  for (let at = 0; at < text.length; ) {
+    const nl = text.indexOf('\n', at);
+    const end = nl < 0 ? text.length : nl;
+    const line = text.slice(at, end);
+    const marker = FENCE.exec(line);
+    if (fence) {
+      if (
+        marker &&
+        marker[1][0] === fence[0] &&
+        marker[1].length >= fence.length &&
+        !marker[2].trim()
+      )
+        fence = null;
+    } else if (marker) {
+      fence = marker[1];
+    } else {
+      const code: Array<[number, number]> = [];
+      for (const m of line.matchAll(/(`+)[^`]*?\1/g)) code.push([m.index!, m.index! + m[0].length]);
+      const inCode = (i: number) => code.some(([a, b]) => i >= a && i < b);
+      const hits: typeof found = [];
+      for (const m of line.matchAll(IMAGE_MARKER))
+        hits.push({ start: m.index!, end: m.index! + m[0].length, source: m[1], alt: '' });
+      for (const m of line.matchAll(IMAGE_MARKDOWN))
+        hits.push({
+          start: m.index!,
+          end: m.index! + m[0].length,
+          source: m[2].replace(/^<|>$/g, ''),
+          alt: m[1].trim(),
+        });
+      hits.sort((a, b) => a.start - b.start);
+      let last = -1;
+      for (const hit of hits) {
+        if (hit.start < last || inCode(hit.start)) continue;
+        const source = hit.source.trim().replace(/^['"]+|['"]+$/g, '');
+        if (!source) continue;
+        found.push({ ...hit, source, start: at + hit.start, end: at + hit.end });
+        last = hit.end;
+      }
+    }
+    at = end + 1;
+  }
+  if (!found.length) return [{ type: 'text', text }];
+  const out: Segment[] = [];
+  let cursor = 0;
+  // Text (not more images) after the last image proves the run has ended.
+  const runEnded = !atTail || Boolean(text.slice(found.at(-1)!.end).trim());
+  found.forEach((hit, k) => {
+    if (hit.start > cursor) out.push({ type: 'text', text: text.slice(cursor, hit.start) });
+    const between = found
+      .slice(k + 1)
+      .some((next, j) => text.slice(j ? found[k + j].end : hit.end, next.start).trim());
+    const done = runEnded || between;
+    out.push({ type: 'block', kind: 'image', source: hit.source, alt: hit.alt, done });
+    cursor = hit.end;
+  });
+  if (cursor < text.length) out.push({ type: 'text', text: text.slice(cursor) });
+  return out;
 }
 
 export interface Cut {
   /** Where in `text` the block stood. Everything before it is already final. */
   at: number;
   kind: BlockKind;
+  /** The block's Markdown; for an image, its path or URL. */
   source: string;
+  /** An image's alt text. */
+  alt?: string;
 }
 
 export interface DiscordView {
@@ -131,6 +213,7 @@ const PLACEHOLDER: Record<BlockKind, string> = {
   table: '⏳ 表格生成中…',
   math: '⏳ 公式生成中…',
   mermaid: '⏳ 流程圖生成中…',
+  image: '⏳ 圖片載入中…',
 };
 
 /**
@@ -148,6 +231,7 @@ export function discordView(reply: string, complete: boolean): DiscordView {
     const tail = reply.slice(reply.lastIndexOf('\n') + 1);
     if (/^ {0,3}(?:`{1,3}|~{1,3}|\$\$?|\\\[?)$|^ {0,3}(?:`{3}|~{3}|\$\$|\\\[)/.test(tail))
       reply = reply.slice(0, reply.length - tail.length);
+    else reply = reply.slice(0, reply.length - tail.length + partialImageAt(tail));
   }
   const segments = segmentReply(reply, complete);
   segments.forEach((segment, index) => {
@@ -159,12 +243,34 @@ export function discordView(reply: string, complete: boolean): DiscordView {
       return;
     }
     if (segment.done) {
-      cuts.push({ at: text.length, kind: segment.kind, source: segment.source });
+      cuts.push({
+        at: text.length,
+        kind: segment.kind,
+        source: segment.source,
+        ...(segment.alt ? { alt: segment.alt } : {}),
+      });
       return;
     }
     text += `${text && !text.endsWith('\n') ? '\n\n' : ''}${PLACEHOLDER[segment.kind]}`;
   });
   return { text, cuts };
+}
+
+/**
+ * Where a half-typed image starts in the reply's last line (or the line's
+ * length when there is none), so `![chart](https://exa` never flashes as text.
+ */
+function partialImageAt(tail: string): number {
+  let cut = tail.length;
+  const marker = tail.lastIndexOf('[[');
+  if (marker >= 0 && tail.indexOf(']]', marker) < 0) cut = marker;
+  const md = tail.lastIndexOf('![');
+  if (md >= 0 && md < cut) {
+    // Unclosed, or a link that may still be growing toward its ")".
+    if (!new RegExp(`^${IMAGE_MARKDOWN.source}`).test(tail.slice(md))) cut = md;
+  }
+  if (cut === tail.length && /(?:^|[^!\]])[![]$/.test(tail)) cut = tail.length - 1;
+  return cut;
 }
 
 // ── inline math → Unicode ──────────────────────────────────────────────
