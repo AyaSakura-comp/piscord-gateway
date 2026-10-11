@@ -15,7 +15,7 @@ describe('streamed Discord replies', () => {
     const send = CLIENT.slice(CLIENT.indexOf('export async function sendResponse('));
     // Must return early, or the reply lands twice.
     expect(send.slice(0, 900)).toMatch(
-      /if \(options\.settleLive !== false && \(await finishLiveResponse\(jid, text\)\)\) return true;/,
+      /if \(options\.settleLive !== false && \(await finishLiveResponse\(jid, text\)\)\) \{[\s\S]{0,80}?return true;/,
     );
   });
 

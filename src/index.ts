@@ -4,6 +4,7 @@ import { initDb, closeDb } from './db.js';
 import { startDiscord, stopDiscord, getBotTag } from './discord/client.js';
 import { startArchiveCleanup } from './session/archive-cleanup.js';
 import { startMediaCleanup } from './session/media.js';
+import { startLivePageServer } from './live-page/server.js';
 import { startProcessingLoop, stopProcessingLoop } from './agent/queue.js';
 import { startScheduler } from './agent/scheduler.js';
 
@@ -24,6 +25,7 @@ export async function startGateway(): Promise<void> {
 
   let stopArchiveCleanup = () => {};
   let stopMediaCleanup = () => {};
+  let stopLivePage = () => {};
   let stopScheduler = () => {};
   let processingStarted = false;
   let shutdownPromise: Promise<void> | null = null;
@@ -57,6 +59,7 @@ export async function startGateway(): Promise<void> {
       stopScheduler();
       stopArchiveCleanup();
       stopMediaCleanup();
+      stopLivePage();
 
       if (processingStarted) {
         await stopProcessingLoop({ timeoutMs: config.shutdownTimeoutMs });
@@ -84,6 +87,7 @@ export async function startGateway(): Promise<void> {
     stopScheduler = startScheduler();
     stopArchiveCleanup = startArchiveCleanup();
     stopMediaCleanup = startMediaCleanup();
+    stopLivePage = await startLivePageServer();
 
     logger.info(
       {

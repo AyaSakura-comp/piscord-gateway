@@ -42,6 +42,7 @@ import { rpcSessionIsStreaming } from '../agent/rpc-session.js';
 import { formatAttachmentTooLargeNotice, isAttachmentTooLargeError } from './send.js';
 import { startGpuPresenceMonitor, stopGpuPresenceMonitor } from './gpu-monitor.js';
 import { executePiExtensionCommand } from '../agent/extension-runner.js';
+import { beginLivePage, completeLivePage, updateLivePage } from '../live-page/server.js';
 
 let client: Client | null = null;
 let triggerPattern: RegExp;
@@ -445,6 +446,39 @@ const liveClosed = new Set<string>();
 /** Start a turn: allow streaming into this channel again. */
 export function beginLiveResponse(jid: string): void {
   liveClosed.delete(jid);
+  beginLivePage(jid);
+  pendingPageLinks.delete(jid);
+}
+
+/**
+ * Links to the turn's live web page (see live-page/server.ts) that are due
+ * once the reply itself has been delivered.
+ */
+const pendingPageLinks = new Map<string, string>();
+
+function livePageLinkText(url: string): string {
+  // Angle brackets suppress Discord's embed: the preview would only ever show
+  // the reply as it was when Discord fetched it, not the live page.
+  return `📄 [網頁版：表格／公式完整排版，即時更新](<${url}>)`;
+}
+
+async function postLivePageLink(jid: string, url: string): Promise<void> {
+  try {
+    const channel = await client?.channels.fetch(jid.replace(/^dc:/, ''));
+    if (!channel || !('send' in channel)) return;
+    await (channel as TextChannel | DMChannel).send(livePageLinkText(url));
+    logger.info({ jid, url }, 'Live page linked');
+  } catch (err: any) {
+    logger.warn({ jid, err: err?.message }, 'live-page: could not post link');
+  }
+}
+
+/** Post the link a just-delivered reply earned, if any. */
+async function flushLivePageLink(jid: string): Promise<void> {
+  const url = pendingPageLinks.get(jid);
+  if (!url) return;
+  pendingPageLinks.delete(jid);
+  await postLivePageLink(jid, url);
 }
 
 /**
@@ -538,6 +572,16 @@ async function awaitLiveOpen(jid: string): Promise<void> {
 /** Feed the growing reply. Safe to call per delta; edits are throttled. */
 export async function updateLiveResponse(jid: string, full: string): Promise<void> {
   if (!client || !full.trim() || liveClosed.has(jid)) return;
+
+  // The web page follows every delta; Discord's edits stay throttled below.
+  // The link goes out as soon as the reply needs it (a table, math, length),
+  // after the reply's first message so it never sits above the answer.
+  const pageLink = updateLivePage(jid, full);
+  if (pageLink) {
+    void (liveOpening.get(jid) ?? Promise.resolve())
+      .catch(() => undefined)
+      .then(() => postLivePageLink(jid, pageLink));
+  }
 
   const known = liveMessages.get(jid);
   if (known) known.latest = full;
@@ -656,6 +700,10 @@ async function deliverRemainder(live: LiveMessage, text: string): Promise<void> 
 
 export async function finishLiveResponse(jid: string, finalText: string): Promise<boolean> {
   await awaitLiveOpen(jid);
+  // Settle the web page whether or not anything streamed into Discord; a link
+  // it still owes is posted by the caller once the reply itself is out.
+  const pageLink = completeLivePage(jid, finalText);
+  if (pageLink) pendingPageLinks.set(jid, pageLink);
   const live = liveMessages.get(jid);
   if (!live) return false;
   // Claim it synchronously. A turn can call sendResponse more than once (one
@@ -722,6 +770,8 @@ export async function finishLiveResponse(jid: string, finalText: string): Promis
 /** Drop a streamed message without finalising it (abort, error, empty turn). */
 export async function discardLiveResponse(jid: string): Promise<void> {
   await awaitLiveOpen(jid);
+  completeLivePage(jid);
+  pendingPageLinks.delete(jid);
   const live = liveMessages.get(jid);
   if (!live) return;
   liveClosed.add(jid);
@@ -848,7 +898,10 @@ export async function sendResponse(
   // streamer also posts through here (thinking blocks, tool status), and
   // settling on those rewrote the half-written reply with a thinking block —
   // the reply appeared to mutate into some other message mid-stream.
-  if (options.settleLive !== false && (await finishLiveResponse(jid, text))) return true;
+  if (options.settleLive !== false && (await finishLiveResponse(jid, text))) {
+    await flushLivePageLink(jid);
+    return true;
+  }
 
   const channelId = jid.replace(/^dc:/, '');
 
@@ -871,6 +924,7 @@ export async function sendResponse(
       }
     }
     logger.info({ jid, length: text.length }, 'Response sent');
+    if (options.settleLive !== false) await flushLivePageLink(jid);
     return true;
   } catch (err: any) {
     logger.error({ jid, err: err.message }, 'Failed to send message');
@@ -884,6 +938,16 @@ export async function sendResponse(
  * fresh client for the standalone CLI). Oversized/missing files are skipped.
  */
 export async function sendFilesResponse(
+  jid: string,
+  text: string,
+  files: string[],
+): Promise<boolean> {
+  const sent = await sendFilesResponseOnce(jid, text, files);
+  await flushLivePageLink(jid);
+  return sent;
+}
+
+async function sendFilesResponseOnce(
   jid: string,
   text: string,
   files: string[],

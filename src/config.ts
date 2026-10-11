@@ -174,6 +174,23 @@ export const config = {
    */
   streamPartialText: envBool('STREAM_PARTIAL_TEXT', true),
 
+  /**
+   * Mirror each streamed reply onto a web page that renders it with piweb's
+   * Markdown renderer while it is still being written, and link it from
+   * Discord. Off unless LIVE_PAGE_PUBLIC_URL names where Discord users reach
+   * it (Discord cannot render tables, math or long replies itself).
+   */
+  livePagePublicUrl: env('LIVE_PAGE_PUBLIC_URL').replace(/\/+$/, ''),
+  livePageEnabled: envBool('LIVE_PAGE_ENABLED', Boolean(env('LIVE_PAGE_PUBLIC_URL'))),
+  livePageHost: env('LIVE_PAGE_HOST', '127.0.0.1'),
+  livePagePort: envInt('LIVE_PAGE_PORT', 8792, { min: 1 }),
+  /** `auto` links only replies Discord renders badly (tables, math, >2000 chars); `always` links every reply. */
+  livePageMode: env('LIVE_PAGE_MODE', 'auto') === 'always' ? ('always' as const) : ('auto' as const),
+  /** piweb's public/ directory: lobehub-rich.js, markdown.js, app.css and vendor/. */
+  livePageAssetsDir: resolveUserPath(env('LIVE_PAGE_ASSETS_DIR', '~/src/piweb/public')),
+  livePageDir: env('LIVE_PAGE_DIR', resolve(DEFAULT_DATA_DIR, 'live-pages')),
+  livePageRetentionDays: envInt('LIVE_PAGE_RETENTION_DAYS', 7, { min: 0 }),
+
   /** Default model for pi */
   piModel: env('PI_MODEL'),
 
