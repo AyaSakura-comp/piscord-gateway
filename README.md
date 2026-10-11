@@ -49,6 +49,8 @@ That's it. The setup wizard checks prerequisites, asks for your Discord bot toke
 - **Cross-platform** — runs on Linux, macOS, and Windows with platform-aware defaults
 - **Typing indicators** — shows "bot is typing" while `pi` processes
 - **Message splitting** — handles Discord's 2000-character limit automatically
+- **Rich blocks as images** — tables, display math and mermaid diagrams (none of which Discord renders) are posted as high-resolution images exactly where they stand in the streamed reply; inline `$…$` math becomes Unicode
+- **Live web page** — each reply is mirrored onto a page that renders it with piweb's Markdown renderer while it streams, linked after the reply
 - **Daemon management** — systemd on Linux, launchd on macOS
 - **Platform-aware paths** — XDG on Linux, `~/Library/Application Support` on macOS, `%LOCALAPPDATA%` on Windows
 
@@ -293,6 +295,17 @@ piscord task enable <id>       # Resume
 piscord task remove <id>       # Delete
 ```
 
+### Rich replies: images in place and a live web page
+
+Discord renders neither GFM tables, LaTeX nor mermaid. With `LIVE_PAGE_PUBLIC_URL` set, the gateway runs a small page server (`LIVE_PAGE_HOST:LIVE_PAGE_PORT`) and:
+
+1. **Mirrors the reply** onto `/r/<id>`, rendered with piweb's LobeHub Streamdown island (per-character fade, KaTeX, highlight.js, mermaid) and updated over Server-Sent Events as pi writes. The assets are served from piweb's `public/` directory (`LIVE_PAGE_ASSETS_DIR`), not vendored. Pages use 128-bit random ids, `noindex`, a strict CSP, and are kept for `LIVE_PAGE_RETENTION_DAYS`.
+2. **Posts blocks as images in place** (`LIVE_RICH_IMAGES`). While a block is still being written Discord shows `⏳ 表格生成中…`; once something after it proves it ended, a warm headless Chrome tab on the server's `/snap` page renders it (~0.1–0.7 s at `LIVE_SNAPSHOT_SCALE`× pixel density) and the image is attached to the message holding the text before it. The text after the block opens a new message, so the image lands exactly where it stood. A block that cannot be rendered is posted as Markdown instead.
+3. **Rewrites inline math** (`$(1+r)^n$` → `(1+r)ⁿ`); what cannot be expressed in Unicode stays as `code`. Code spans, fenced code and money (`$5 and $10`) are left alone.
+4. **Links the page** after the reply when it contained a table, math, a diagram, or more than 2000 characters (`LIVE_PAGE_MODE=auto`), or after every reply (`always`). The link suppresses Discord's embed, which would only ever show a stale snapshot.
+
+The page server must be reachable from the public internet for Discord users to open links — for example behind a Tailscale Funnel or reverse proxy pointing at `LIVE_PAGE_PORT`. `LIVE_PAGE_HOST` takes several comma-separated addresses (e.g. loopback plus a docker bridge a proxy container forwards from).
+
 ### Sending messages and files to Discord
 
 pi can send plain text messages, files, or both to any Discord channel using the gateway's built-in relay.
@@ -361,6 +374,18 @@ Most users won't need to edit this file directly — `piscord setup` generates i
 | `SESSIONS_DIR`               | _(platform default)_/sessions   | Session storage directory (see Data Locations)                             |
 | `DB_PATH`                    | _(platform default)_/gateway.db | SQLite database path (see Data Locations)                                  |
 | `LOG_LEVEL`                  | `info`                          | Log level: debug/info/warn/error                                           |
+| `STREAM_PARTIAL_TEXT`        | `true`                          | Stream the reply by editing one Discord message as it is written           |
+| `LIVE_PAGE_PUBLIC_URL`       | _(none)_                        | Public base URL of the live page server; enables rich replies when set     |
+| `LIVE_PAGE_ENABLED`          | `true` if the URL is set        | Turn the live page server off without removing the URL                     |
+| `LIVE_PAGE_HOST`             | `127.0.0.1`                     | Listen address(es), comma-separated                                        |
+| `LIVE_PAGE_PORT`             | `8792`                          | Listen port                                                                |
+| `LIVE_PAGE_MODE`             | `auto`                          | `auto`: link replies with tables/math/diagrams/>2000 chars; `always`       |
+| `LIVE_PAGE_ASSETS_DIR`       | `~/src/piweb/public`            | piweb `public/` dir providing `lobehub-rich.js`, `markdown.js`, `app.css`, `vendor/` |
+| `LIVE_PAGE_DIR`              | _(platform default)_/live-pages | Where finished pages are stored                                            |
+| `LIVE_PAGE_RETENTION_DAYS`   | `7`                             | Days to keep pages (0 = forever)                                           |
+| `LIVE_RICH_IMAGES`           | `true`                          | Post tables / display math / mermaid as images in place                    |
+| `LIVE_SNAPSHOT_SCALE`        | `3`                             | Device pixel ratio of those images                                         |
+| `LIVE_SNAPSHOT_CHROME`       | `/usr/bin/google-chrome`        | Chrome/Chromium binary used to render them                                 |
 
 After changing config, restart the service: `piscord daemon stop && piscord daemon start`
 

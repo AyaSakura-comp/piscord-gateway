@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Rich blocks as images in place**: GFM tables, display math (`$$…$$`, `\[…\]`) and mermaid diagrams are rendered by a warm headless Chrome tab (piweb's renderer, Discord dark palette, 3× pixel density) and posted exactly where they stand in the streamed reply — the message is cut at each finished block, the image rides on the text before it, and the text after opens a new message. A placeholder shows while a block is still being written; unrenderable blocks fall back to Markdown. Inline `$…$` math is rewritten to Unicode. Non-streamed replies take the same path.
+- **Live web page**: every streamed reply is mirrored onto `/r/<id>`, rendered with piweb's LobeHub Streamdown renderer and updated over SSE while pi writes; Discord gets a link after replies that contain tables, math, diagrams or exceed 2000 characters (`LIVE_PAGE_MODE`). New settings: `LIVE_PAGE_*`, `LIVE_RICH_IMAGES`, `LIVE_SNAPSHOT_SCALE`, `LIVE_SNAPSHOT_CHROME`.
+
 ### Fixed
 
 - **Warm RPC session invalidation on configuration changes**: modifying channel model (`/pi model`, `/pi reset-model`), thinking level (`/pi thinking`), or working directory (`/pi cwd`, `/pi reset-cwd`) now immediately closes the channel's idle warm RPC session so subsequent turns spawn fresh processes with the new settings.
