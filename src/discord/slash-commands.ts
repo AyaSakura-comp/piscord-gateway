@@ -50,6 +50,7 @@ import {
 } from '../agent/channel-settings.js';
 import { isChannelProcessing, stopChannelTask } from '../agent/queue.js';
 import { closeRpcSession } from '../agent/rpc-session.js';
+import { closeClaudeTmuxSession } from '../agent/claude-tmux.js';
 import { executePiExtensionCommand } from '../agent/extension-runner.js';
 import { getAgyUsageReport } from '../agy-usage.js';
 import { getGptUsageText } from '../gpt-usage.js';
@@ -389,6 +390,8 @@ async function handleNew(interaction: ChatInputCommandInteraction): Promise<void
   // alive across the rename makes the next prompt fail with ENOENT on a .jsonl
   // that now lives in the archive. The next message simply spawns a fresh one.
   const closedRpc = closeRpcSession(channel.folder);
+  // A Claude Code TUI would otherwise carry the old conversation into the new session.
+  closeClaudeTmuxSession(channel.folder);
   const archivedSession = rotateChannelSessionDir(channel.folder);
   resetChannelThinkingToolStatus(channel.jid);
 

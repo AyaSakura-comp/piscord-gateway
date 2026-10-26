@@ -21,7 +21,8 @@ import {
 } from '../db.js';
 import { invokeAgent, UNTIL_DONE_MARKER } from './invoke.js';
 import { invokeAgy, isAgyModelRef } from './agy.js';
-import { abortRpcSession, getRpcSession, closeAllRpcSessions } from './rpc-session.js';
+import { invokeClaudeTmux, isClaudeTmuxModelRef } from './claude-tmux.js';
+import { abortRpcSession, getRpcSession, closeAllRpcSessions, closeRpcSession } from './rpc-session.js';
 import { parseOutboxMarkers } from './outbox.js';
 import { richImagesActive } from '../live-page/server.js';
 import {
@@ -279,8 +280,41 @@ async function processMessage(
     // Antigravity CLI, which owns its own tools and conversation store. It has
     // no RPC/steer mode, so this branch precedes the RPC one.
     const useAgy = isAgyModelRef(effective.rawModelRef);
+    // Claude Code models run in a persistent per-channel TUI under tmux, which
+    // owns its own conversation; retire any warm pi process first.
+    const useClaudeTmux = isClaudeTmuxModelRef(effective.rawModelRef);
+    if (useClaudeTmux && config.claudeTmuxEnabled) closeRpcSession(channel.folder);
 
-    const result = useAgy
+    const result = useClaudeTmux
+      ? config.claudeTmuxEnabled
+        ? await invokeClaudeTmux(channel.folder, prompt, {
+            channelJid: jid,
+            turnId: rowid,
+            model: effective.rawModelRef,
+            thinking: effective.hasManagedThinking ? effective.effectiveThinking : undefined,
+            cwd: effective.effectiveCwd,
+            signal,
+            attachments,
+            onEvent,
+            onBackgroundReply: async (text) => {
+              const { text: outText, files: outFiles } = parseOutboxMarkers(text, undefined, {
+                keepImages: richImagesActive(),
+              });
+              const sent =
+                outFiles.length > 0
+                  ? await sendFilesResponse(jid, outText, outFiles)
+                  : await sendResponse(jid, outText);
+              if (!sent) throw new Error('Claude background reply could not be delivered');
+            },
+          })
+        : {
+            ok: false,
+            text: '',
+            error:
+              'Claude Code is disabled on this gateway (CLAUDE_TMUX_ENABLED=false). ' +
+              'Switch models with /pi model, or enable the Claude tmux bridge in config.env.',
+          }
+      : useAgy
       ? await invokeAgy(channel.folder, prompt, {
           model: effective.rawModelRef,
           thinking: effective.hasManagedThinking ? effective.effectiveThinking : undefined,
