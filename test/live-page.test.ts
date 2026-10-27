@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 
@@ -10,7 +11,10 @@ writeFileSync(resolve(assets, 'app.css'), 'body{}');
 // The renderer's module graph, minified and not: lobehub-rich → markdown →
 // media-files → deep; app.js is a sibling nothing imports.
 writeFileSync(resolve(assets, 'lobehub-rich.js'), 'import{a as b}from"./markdown.js";export{b}');
-writeFileSync(resolve(assets, 'markdown.js'), "import { x } from './media-files.js';\nexport const a = x;");
+writeFileSync(
+  resolve(assets, 'markdown.js'),
+  "import { x } from './media-files.js';\nexport const a = x;",
+);
 writeFileSync(resolve(assets, 'media-files.js'), "export const x = 1; import('./deep.js');");
 writeFileSync(resolve(assets, 'deep.js'), 'export {};');
 writeFileSync(resolve(assets, 'app.js'), 'secret();');
@@ -126,6 +130,23 @@ describe('http surface', () => {
     expect((await fetch(`${base}/app.js`)).status).toBe(404);
   });
 
+  it('reports what the renderer needs and this server never serves', async () => {
+    const dir = mkdtempSync(resolve(tmpdir(), 'piscord-renderer-'));
+    writeFileSync(resolve(dir, 'lobehub-rich.js'), 'import"./markdown.js";import"react";');
+    writeFileSync(
+      resolve(dir, 'markdown.js'),
+      "import { x } from '../src/x.js';\nexport * from './sub/y.js';\nimport('./gone.js');",
+    );
+    const { files, problems } = await live.rendererModuleGraph(dir);
+    expect([...files].sort()).toEqual(['gone.js', 'lobehub-rich.js', 'markdown.js']);
+    expect(problems.sort()).toEqual([
+      'gone.js is missing',
+      'lobehub-rich.js imports react, which is not a ./name.js beside it',
+      'markdown.js imports ../src/x.js, which is not a ./name.js beside it',
+      'markdown.js imports ./sub/y.js, which is not a ./name.js beside it',
+    ]);
+  });
+
   it('cannot be broken out of by the reply text', () => {
     const html = live.renderPageHtml({
       id: idOf(`${base}/r/${'C'.repeat(22)}`),
@@ -154,3 +175,37 @@ describe('http surface', () => {
     );
   });
 });
+
+// The renderer this bot really serves: piweb's public/, as checked out beside
+// it. Skipped where piweb is not there (CI); piweb runs the same contract in
+// test/piscord-renderer-contract.test.ts and test/e2e/piscord-renderer.spec.ts.
+const PIWEB_PUBLIC = resolve(homedir(), 'src/piweb/public');
+describe.skipIf(!existsSync(resolve(PIWEB_PUBLIC, 'lobehub-rich.js')))(
+  'piweb renderer contract',
+  () => {
+    it('loads entirely from what this server serves', async () => {
+      const { files, problems } = await live.rendererModuleGraph(PIWEB_PUBLIC);
+      expect(problems).toEqual([]);
+      expect(files.has('markdown.js')).toBe(true);
+    });
+
+    it('exports what the snap and live pages import', async () => {
+      const { readFileSync } = await import('node:fs');
+      const bundle = readFileSync(resolve(PIWEB_PUBLIC, 'lobehub-rich.js'), 'utf8');
+      const exported = /export\s*\{([^}]*)\}\s*;?\s*$/.exec(bundle.trim())?.[1] ?? '';
+      const names = exported.split(',').map((e) =>
+        e
+          .trim()
+          .split(/\s+as\s+/)
+          .pop(),
+      );
+      expect(names).toEqual(expect.arrayContaining(['renderLobehubStatic', 'updateLobehubRich']));
+      for (const file of [
+        'app.css',
+        'vendor/katex/katex.min.js',
+        'vendor/highlight/highlight.min.js',
+      ])
+        expect(existsSync(resolve(PIWEB_PUBLIC, file)), file).toBe(true);
+    });
+  },
+);

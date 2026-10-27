@@ -323,14 +323,34 @@ const MIME: Record<string, string> = {
  */
 const ASSET_ENTRIES = ['lobehub-rich.js', 'markdown.js'];
 const ASSET_FILES = new Set([...ASSET_ENTRIES, 'app.css', 'favicon.svg']);
-const RELATIVE_IMPORT_RE = /(?:\bfrom\s*|\bimport\s*\(?\s*)["']\.\/([\w.-]+\.js)["']/g;
+const SAME_DIR_MODULE = /^\.\/[\w.-]+\.js$/;
+/** Static (with or without bindings), re-export and dynamic imports. */
+const IMPORT_PATTERNS = [
+  /\bimport\s*(?:[\w*{}\s,$]+?\s*from\s*)?["']([^"']+)["']/g,
+  /\bexport\s*(?:\*|\{[^}]*\})\s*from\s*["']([^"']+)["']/g,
+  /\bimport\s*\(\s*["']([^"']+)["']\s*\)/g,
+];
 const MODULE_GRAPH_TTL_MS = 30_000;
-let moduleGraph: { at: number; root: string; files: Set<string> } | undefined;
 
-export async function rendererModules(root: string): Promise<Set<string>> {
+export function importSpecifiers(source: string): string[] {
+  const specs = new Set<string>();
+  for (const re of IMPORT_PATTERNS) for (const m of source.matchAll(re)) specs.add(m[1]);
+  return [...specs];
+}
+
+interface ModuleGraph {
+  /** Modules served: the entries and their same-directory imports. */
+  files: Set<string>;
+  /** What the page would fail to load: a missing module, or an import this server never serves. */
+  problems: string[];
+}
+let moduleGraph: { at: number; root: string; graph: ModuleGraph } | undefined;
+
+export async function rendererModuleGraph(root: string): Promise<ModuleGraph> {
   if (moduleGraph && moduleGraph.root === root && Date.now() - moduleGraph.at < MODULE_GRAPH_TTL_MS)
-    return moduleGraph.files;
+    return moduleGraph.graph;
   const files = new Set<string>();
+  const problems: string[] = [];
   const queue = [...ASSET_ENTRIES];
   while (queue.length) {
     const file = queue.shift()!;
@@ -340,12 +360,17 @@ export async function rendererModules(root: string): Promise<Set<string>> {
     try {
       source = await readFile(resolve(root, file), 'utf8');
     } catch {
+      problems.push(`${file} is missing`);
       continue;
     }
-    for (const match of source.matchAll(RELATIVE_IMPORT_RE)) queue.push(match[1]);
+    for (const spec of importSpecifiers(source)) {
+      if (SAME_DIR_MODULE.test(spec)) queue.push(spec.slice(2));
+      else problems.push(`${file} imports ${spec}, which is not a ./name.js beside it`);
+    }
   }
-  moduleGraph = { at: Date.now(), root, files };
-  return files;
+  const graph = { files, problems };
+  moduleGraph = { at: Date.now(), root, graph };
+  return graph;
 }
 
 const CSP = [
@@ -378,7 +403,11 @@ function send(res: ServerResponse, status: number, type: string, body: string | 
 
 async function serveAsset(res: ServerResponse, rel: string): Promise<void> {
   const root = resolve(config.livePageAssetsDir);
-  if (!ASSET_FILES.has(rel) && !rel.startsWith('vendor/') && !(await rendererModules(root)).has(rel))
+  if (
+    !ASSET_FILES.has(rel) &&
+    !rel.startsWith('vendor/') &&
+    !(await rendererModuleGraph(root)).files.has(rel)
+  )
     return send(res, 404, 'text/plain', 'not found');
   const path = resolve(root, rel);
   if (!path.startsWith(root + sep)) return send(res, 404, 'text/plain', 'not found');
@@ -570,6 +599,19 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
  * loopback plus the docker bridge a Funnel sidecar proxies from). Resolves
  * once listening; returns a stop function.
  */
+/**
+ * Say so at startup when piweb's renderer needs something this server cannot
+ * serve: otherwise the only sign is every table going to Discord as text.
+ */
+async function checkRenderer(): Promise<void> {
+  const { problems } = await rendererModuleGraph(resolve(config.livePageAssetsDir));
+  if (problems.length)
+    logger.error(
+      { problems, assets: config.livePageAssetsDir },
+      'live-page: the renderer cannot load here; tables, math and mermaid will go out as text',
+    );
+}
+
 export async function startLivePageServer(): Promise<() => void> {
   if (!config.livePageEnabled || !config.livePagePublicUrl) return () => undefined;
   mkdirSync(config.livePageDir, { recursive: true });
@@ -601,6 +643,7 @@ export async function startLivePageServer(): Promise<() => void> {
   }
   if (!listening.length) return () => undefined;
   server = listening[0];
+  void checkRenderer();
   void cleanupOldPages();
   cleanupTimer = setInterval(() => void cleanupOldPages(), 6 * 3_600_000);
   cleanupTimer.unref?.();

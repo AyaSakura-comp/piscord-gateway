@@ -47,8 +47,32 @@ async function ensurePage(): Promise<Page> {
     height: 900,
     deviceScaleFactor: config.liveSnapshotScale,
   });
-  await page.goto(snapUrl(), { waitUntil: 'load' });
-  await page.waitForFunction('window.__snapReady === true', { timeout: 10_000 });
+  // A renderer module that 404s or throws leaves __snapReady unset; name it in
+  // the error instead of a bare timeout.
+  const loadProblems: string[] = [];
+  const onResponse = (r: { status(): number; url(): string }) => {
+    const path = new URL(r.url()).pathname;
+    // Chrome asks for /favicon.ico on its own; the page never needs it.
+    if (r.status() >= 400 && path !== '/favicon.ico') loadProblems.push(`${r.status()} ${path}`);
+  };
+  const onError = (e: unknown) => {
+    loadProblems.push(`pageerror: ${e instanceof Error ? e.message : String(e)}`);
+  };
+  page.on('response', onResponse);
+  page.on('pageerror', onError);
+  try {
+    await page.goto(snapUrl(), { waitUntil: 'load' });
+    await page.waitForFunction('window.__snapReady === true', { timeout: 10_000 });
+  } catch (err: any) {
+    throw new Error(
+      loadProblems.length
+        ? `snap page did not load: ${loadProblems.join('; ')}`
+        : (err?.message ?? String(err)),
+    );
+  } finally {
+    page.off('response', onResponse);
+    page.off('pageerror', onError);
+  }
   return page;
 }
 
