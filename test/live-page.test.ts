@@ -7,6 +7,13 @@ const root = mkdtempSync(resolve(tmpdir(), 'piscord-live-page-'));
 const assets = resolve(root, 'public');
 mkdirSync(resolve(assets, 'vendor'), { recursive: true });
 writeFileSync(resolve(assets, 'app.css'), 'body{}');
+// The renderer's module graph, minified and not: lobehub-rich → markdown →
+// media-files → deep; app.js is a sibling nothing imports.
+writeFileSync(resolve(assets, 'lobehub-rich.js'), 'import{a as b}from"./markdown.js";export{b}');
+writeFileSync(resolve(assets, 'markdown.js'), "import { x } from './media-files.js';\nexport const a = x;");
+writeFileSync(resolve(assets, 'media-files.js'), "export const x = 1; import('./deep.js');");
+writeFileSync(resolve(assets, 'deep.js'), 'export {};');
+writeFileSync(resolve(assets, 'app.js'), 'secret();');
 writeFileSync(resolve(root, 'secret.txt'), 'nope');
 const PORT = 18_792 + Math.floor(Math.random() * 500);
 process.env.LIVE_PAGE_PUBLIC_URL = `http://127.0.0.1:${PORT}/`;
@@ -111,6 +118,12 @@ describe('http surface', () => {
     expect((await fetch(`${base}/vendor/../../secret.txt`)).status).toBe(404);
     expect((await fetch(`${base}/vendor/%2e%2e/%2e%2e/secret.txt`)).status).toBe(404);
     expect((await fetch(`${base}/r/${'B'.repeat(22)}`)).status).toBe(404);
+  });
+
+  it('serves every module the renderer imports, however deep, and no other script', async () => {
+    for (const file of ['lobehub-rich.js', 'markdown.js', 'media-files.js', 'deep.js'])
+      expect((await fetch(`${base}/${file}`)).status, file).toBe(200);
+    expect((await fetch(`${base}/app.js`)).status).toBe(404);
   });
 
   it('cannot be broken out of by the reply text', () => {

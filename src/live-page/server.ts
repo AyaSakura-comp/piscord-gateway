@@ -313,8 +313,40 @@ const MIME: Record<string, string> = {
   '.avif': 'image/avif',
 };
 
-/** Only the renderer's files are served out of piweb's public/ directory. */
-const ASSET_FILES = new Set(['lobehub-rich.js', 'markdown.js', 'app.css', 'favicon.svg']);
+/**
+ * Only the renderer's files are served out of piweb's public/ directory: its
+ * entry modules, every module they import from the same directory (at any
+ * depth), and the stylesheet. The imports are read from the files themselves,
+ * because piweb adds them freely: markdown.js importing media-files.js
+ * (2026-10-27) 404'd here, the module graph never loaded, and every table and
+ * formula went to Discord as raw Markdown.
+ */
+const ASSET_ENTRIES = ['lobehub-rich.js', 'markdown.js'];
+const ASSET_FILES = new Set([...ASSET_ENTRIES, 'app.css', 'favicon.svg']);
+const RELATIVE_IMPORT_RE = /(?:\bfrom\s*|\bimport\s*\(?\s*)["']\.\/([\w.-]+\.js)["']/g;
+const MODULE_GRAPH_TTL_MS = 30_000;
+let moduleGraph: { at: number; root: string; files: Set<string> } | undefined;
+
+export async function rendererModules(root: string): Promise<Set<string>> {
+  if (moduleGraph && moduleGraph.root === root && Date.now() - moduleGraph.at < MODULE_GRAPH_TTL_MS)
+    return moduleGraph.files;
+  const files = new Set<string>();
+  const queue = [...ASSET_ENTRIES];
+  while (queue.length) {
+    const file = queue.shift()!;
+    if (files.has(file)) continue;
+    files.add(file);
+    let source: string;
+    try {
+      source = await readFile(resolve(root, file), 'utf8');
+    } catch {
+      continue;
+    }
+    for (const match of source.matchAll(RELATIVE_IMPORT_RE)) queue.push(match[1]);
+  }
+  moduleGraph = { at: Date.now(), root, files };
+  return files;
+}
 
 const CSP = [
   "default-src 'self'",
@@ -345,9 +377,9 @@ function send(res: ServerResponse, status: number, type: string, body: string | 
 }
 
 async function serveAsset(res: ServerResponse, rel: string): Promise<void> {
-  if (!ASSET_FILES.has(rel) && !rel.startsWith('vendor/'))
-    return send(res, 404, 'text/plain', 'not found');
   const root = resolve(config.livePageAssetsDir);
+  if (!ASSET_FILES.has(rel) && !rel.startsWith('vendor/') && !(await rendererModules(root)).has(rel))
+    return send(res, 404, 'text/plain', 'not found');
   const path = resolve(root, rel);
   if (!path.startsWith(root + sep)) return send(res, 404, 'text/plain', 'not found');
   try {
