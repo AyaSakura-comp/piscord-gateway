@@ -4,8 +4,8 @@
  * A single headless Chrome tab stays open on the live-page server's /snap
  * page, which carries piweb's renderer, so an image looks exactly like the web
  * page and a render costs a fraction of a second instead of a browser launch.
- * Renders are serialized; a stuck or crashed browser is thrown away and the
- * next render starts a fresh one.
+ * Renders are serialized; a crashed tab, or a stuck or crashed browser, is
+ * thrown away and the next render starts a fresh one.
  */
 import puppeteer, { type Browser, type Page } from 'puppeteer-core';
 import { config } from '../config.js';
@@ -42,6 +42,15 @@ async function ensurePage(): Promise<Page> {
   }
   page = await browser.newPage();
   rendersOnPage = 0;
+  // A tab whose renderer was killed (earlyoom picks Chrome renderers first when
+  // memory runs low) stays open and connected but never answers again, so the
+  // next render would wait out the timeout and the table go out as text. Drop
+  // it the moment it crashes; the next render opens a fresh tab.
+  const tab = page;
+  tab.on('error', () => {
+    if (page === tab) page = undefined;
+    void tab.close().catch(() => undefined);
+  });
   await page.setViewport({
     width: 1400,
     height: 900,
